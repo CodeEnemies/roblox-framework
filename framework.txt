@@ -1,0 +1,4290 @@
+-- AnimationManager.lua
+-- Armazene em ReplicatedStorage.Modules.AnimationManager
+
+local AnimationManager = {}
+AnimationManager.__index = AnimationManager
+
+function AnimationManager.new(animator, configModule)
+	local self = setmetatable({}, AnimationManager)
+
+	self.animator = animator
+	self.tracks = {}
+	self.config = configModule
+
+	self:loadAnimations()
+
+	return self
+end
+
+function AnimationManager:loadAnimations()
+	local assetIds = self.config.AssetIds.Animations
+
+	for name, id in pairs(assetIds) do
+		local animation = Instance.new("Animation")
+		animation.AnimationId = id
+
+		local track = self.animator:LoadAnimation(animation)
+		self.tracks[name] = track
+
+		print("Animação " .. name .. " carregada: " .. tostring(track ~= nil))
+	end
+end
+
+function AnimationManager:getTrack(trackName)
+	return self.tracks[trackName]
+end
+
+function AnimationManager:playTrack(trackName)
+	local track = self.tracks[trackName]
+	if track then
+		track:Play()
+		return true
+	else
+		warn("Track não encontrado: " .. tostring(trackName))
+		return false
+	end
+end
+
+function AnimationManager:stopTrack(trackName)
+	local track = self.tracks[trackName]
+	if track then
+		track:Stop()
+		return true
+	end
+	return false
+end
+
+function AnimationManager:isPlaying(trackName)
+	local track = self.tracks[trackName]
+	return track and track.IsPlaying or false
+end
+
+function AnimationManager:waitForTrackEnd(trackName)
+	local track = self.tracks[trackName]
+	if track then
+		track.Stopped:Wait()
+	end
+end
+
+function AnimationManager:cleanup()
+	for _, track in pairs(self.tracks) do
+		track:Stop()
+	end
+end
+
+return AnimationManager
+-- CombatController.lua
+-- Armazene em ReplicatedStorage.Modules.CombatController
+
+local CombatController = {}
+CombatController.__index = CombatController
+
+function CombatController.new(humanoid, animationManager, soundManager, combatEvent)
+	local self = setmetatable({}, CombatController)
+
+	self.humanoid = humanoid
+	self.animationManager = animationManager
+	self.soundManager = soundManager
+	self.combatEvent = combatEvent
+
+	self.isPunching = false
+	self.isKicking = false
+
+	return self
+end
+
+function CombatController:tryAttack(attackType, limb, staminaThreshold)
+	print("tryAttack chamado com attackType: " .. tostring(attackType))
+
+	local staminaValue = self.humanoid:FindFirstChild("Stamina")
+	if not staminaValue then
+		warn("Stamina não encontrada!")
+		return false
+	end
+
+	-- Verificar se está vivo
+	if self.humanoid.Health <= 0 then
+		print("Jogador morto, ataque cancelado")
+		return false
+	end
+
+	-- Verificar se já está atacando
+	if (attackType == "KickL" and self.isKicking) or (attackType ~= "KickL" and self.isPunching) then
+		print("Já está atacando, ataque cancelado")
+		return false
+	end
+
+	-- Verificar stamina
+	if staminaValue.Value < staminaThreshold then
+		return false
+	end
+
+	-- Verificar se animação existe
+	if not self.animationManager:getTrack(attackType) then
+		warn("Erro: Animação para " .. tostring(attackType) .. " não encontrada!")
+		return false
+	end
+
+	-- Marcar estado de ataque
+	if attackType == "KickL" then
+		self.isKicking = true
+	else
+		self.isPunching = true
+	end
+
+	-- Executar ataque
+	print("Tocando animação: " .. attackType)
+	self.animationManager:playTrack(attackType)
+	self.soundManager:playSound("Punch")
+	self.combatEvent:FireServer(attackType, limb)
+
+	-- Aguardar fim da animação
+	self.animationManager:waitForTrackEnd(attackType)
+
+	-- Resetar estado
+	if attackType == "KickL" then
+		self.isKicking = false
+	else
+		self.isPunching = false
+	end
+
+	return true
+end
+
+function CombatController:tryDance(danceType)
+	if self.humanoid.Health <= 0 then
+		print("Jogador morto, dança cancelada")
+		return false
+	end
+
+	local staminaValue = self.humanoid:FindFirstChild("Stamina")
+	if not staminaValue or staminaValue.Value < 10 then
+		return false
+	end
+
+	return self.animationManager:playTrack(danceType)
+end
+
+function CombatController:reset()
+	self.isPunching = false
+	self.isKicking = false
+end
+
+return CombatController
+-- ComboController.lua
+-- Armazene em ReplicatedStorage.Modules.ComboController
+
+local TweenService = game:GetService("TweenService")
+
+local ComboController = {}
+ComboController.__index = ComboController
+
+function ComboController.new(player, config)
+	local self = setmetatable({}, ComboController)
+
+	self.player = player
+	self.config = config
+
+	-- Estado do combo
+	self.currentCombo = {
+		hits = 0,
+		damage = 0,
+		target = nil,
+		lastHitTime = 0
+	}
+
+	-- UI Elements
+	self.comboUI = nil
+	self.hitsLabel = nil
+	self.damageLabel = nil
+	self.timerBar = nil
+	self.backgroundFrame = nil
+
+	-- Tween da barra
+	self.barTween = nil
+
+	-- Task de timeout
+	self.timeoutTask = nil
+
+	if self.config.Combo.Enabled and self.config.Combo.ShowUI then
+		self:createUI()
+	end
+
+	print("ComboController inicializado")
+
+	return self
+end
+
+-- Criar UI do combo
+function ComboController:createUI()
+	local playerGui = self.player:WaitForChild("PlayerGui")
+
+	-- ScreenGui principal
+	self.comboUI = Instance.new("ScreenGui")
+	self.comboUI.Name = "ComboUI"
+	self.comboUI.DisplayOrder = 10
+	self.comboUI.ResetOnSpawn = false
+	self.comboUI.Enabled = false -- Inicia oculto
+	self.comboUI.Parent = playerGui
+
+	-- Frame de fundo
+	self.backgroundFrame = Instance.new("Frame")
+	self.backgroundFrame.Name = "ComboFrame"
+	self.backgroundFrame.Size = UDim2.new(0, 200, 0, 100)
+	self.backgroundFrame.Position = self.config.Combo.UIPosition
+	self.backgroundFrame.AnchorPoint = Vector2.new(0.5, 0)
+	self.backgroundFrame.BackgroundColor3 = self.config.Combo.Colors.Background
+	self.backgroundFrame.BackgroundTransparency = 1 - self.config.Combo.Colors.BackgroundAlpha
+	self.backgroundFrame.BorderSizePixel = 0
+	self.backgroundFrame.Parent = self.comboUI
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = self.backgroundFrame
+
+	-- Label de HITS
+	self.hitsLabel = Instance.new("TextLabel")
+	self.hitsLabel.Name = "HitsLabel"
+	self.hitsLabel.Size = UDim2.new(1, 0, 0.3, 0)
+	self.hitsLabel.Position = UDim2.new(0, 0, 0.05, 0)
+	self.hitsLabel.BackgroundTransparency = 1
+	self.hitsLabel.TextColor3 = self.config.Combo.Colors.HitsText
+	self.hitsLabel.TextScaled = true
+	self.hitsLabel.Font = Enum.Font.GothamBold
+	self.hitsLabel.Text = "0 HITS"
+	self.hitsLabel.Parent = self.backgroundFrame
+
+	-- Container da barra de timer
+	local timerBarContainer = Instance.new("Frame")
+	timerBarContainer.Name = "TimerBarContainer"
+	timerBarContainer.Size = UDim2.new(0.9, 0, 0.08, 0)
+	timerBarContainer.Position = UDim2.new(0.5, 0, 0.45, 0)
+	timerBarContainer.AnchorPoint = Vector2.new(0.5, 0.5)
+	timerBarContainer.BackgroundColor3 = self.config.Combo.Colors.BarEmpty
+	timerBarContainer.BorderSizePixel = 0
+	timerBarContainer.Parent = self.backgroundFrame
+
+	local barCorner = Instance.new("UICorner")
+	barCorner.CornerRadius = UDim.new(1, 0)
+	barCorner.Parent = timerBarContainer
+
+	-- Barra de timer (progresso)
+	self.timerBar = Instance.new("Frame")
+	self.timerBar.Name = "TimerBar"
+	self.timerBar.Size = UDim2.new(1, 0, 1, 0)
+	self.timerBar.BackgroundColor3 = self.config.Combo.Colors.BarFull
+	self.timerBar.BorderSizePixel = 0
+	self.timerBar.Parent = timerBarContainer
+
+	local barInnerCorner = Instance.new("UICorner")
+	barInnerCorner.CornerRadius = UDim.new(1, 0)
+	barInnerCorner.Parent = self.timerBar
+
+	-- Label de DANO
+	self.damageLabel = Instance.new("TextLabel")
+	self.damageLabel.Name = "DamageLabel"
+	self.damageLabel.Size = UDim2.new(1, 0, 0.35, 0)
+	self.damageLabel.Position = UDim2.new(0, 0, 0.6, 0)
+	self.damageLabel.BackgroundTransparency = 1
+	self.damageLabel.TextColor3 = self.config.Combo.Colors.DamageText
+	self.damageLabel.TextScaled = true
+	self.damageLabel.Font = Enum.Font.GothamBold
+	self.damageLabel.Text = "0 DMG"
+	self.damageLabel.Parent = self.backgroundFrame
+
+	print("Combo UI criada")
+end
+
+-- Adicionar hit ao combo
+function ComboController:addHit(target, damage)
+	if not self.config.Combo.Enabled then
+		return
+	end
+
+	local currentTime = tick()
+
+	-- Verificar se é o mesmo alvo e dentro do tempo
+	if self.currentCombo.target == target and 
+		(currentTime - self.currentCombo.lastHitTime) < self.config.Combo.TimeoutDuration then
+		-- Continua combo
+		self.currentCombo.hits = self.currentCombo.hits + 1
+		self.currentCombo.damage = self.currentCombo.damage + damage
+	else
+		-- Novo combo
+		self.currentCombo.hits = 1
+		self.currentCombo.damage = damage
+		self.currentCombo.target = target
+
+		-- Mostrar UI
+		if self.comboUI then
+			self.comboUI.Enabled = true
+		end
+	end
+
+	self.currentCombo.lastHitTime = currentTime
+
+	-- Atualizar UI
+	self:updateUI()
+
+	-- Reiniciar timer da barra
+	self:startBarTimer()
+
+	-- Animação de pop
+	if self.config.Combo.PopAnimation then
+		self:playPopAnimation()
+	end
+
+	-- Cancelar timeout anterior e criar novo
+	if self.timeoutTask then
+		task.cancel(self.timeoutTask)
+	end
+
+	self.timeoutTask = task.delay(self.config.Combo.TimeoutDuration, function()
+		self:resetCombo()
+	end)
+
+	print("Combo: " .. self.currentCombo.hits .. " hits, " .. self.currentCombo.damage .. " damage")
+end
+
+-- Atualizar UI
+function ComboController:updateUI()
+	if not self.hitsLabel or not self.damageLabel then
+		return
+	end
+
+	self.hitsLabel.Text = self.currentCombo.hits .. " HIT" .. (self.currentCombo.hits > 1 and "S" or "")
+	self.damageLabel.Text = self.currentCombo.damage .. " DMG"
+end
+
+-- Iniciar animação da barra de timer
+function ComboController:startBarTimer()
+	if not self.timerBar then
+		return
+	end
+
+	-- Cancelar tween anterior
+	if self.barTween then
+		self.barTween:Cancel()
+	end
+
+	-- Resetar barra para cheia
+	self.timerBar.Size = UDim2.new(1, 0, 1, 0)
+
+	-- Criar tween para esvaziar
+	local tweenInfo = TweenInfo.new(
+		self.config.Combo.TimeoutDuration,
+		Enum.EasingStyle.Linear,
+		Enum.EasingDirection.InOut
+	)
+
+	local goal = {Size = UDim2.new(0, 0, 1, 0)}
+
+	self.barTween = TweenService:Create(self.timerBar, tweenInfo, goal)
+	self.barTween:Play()
+end
+
+-- Animação de pop
+function ComboController:playPopAnimation()
+	if not self.backgroundFrame then
+		return
+	end
+
+	-- Escala para maior
+	local tweenInfo = TweenInfo.new(
+		self.config.Combo.PopDuration,
+		Enum.EasingStyle.Back,
+		Enum.EasingDirection.Out
+	)
+
+	local goalBig = {Size = UDim2.new(0, 200 * self.config.Combo.PopScale, 0, 100 * self.config.Combo.PopScale)}
+	local tweenBig = TweenService:Create(self.backgroundFrame, tweenInfo, goalBig)
+
+	tweenBig:Play()
+
+	-- Voltar ao normal
+	tweenBig.Completed:Connect(function()
+		local tweenInfoBack = TweenInfo.new(
+			self.config.Combo.PopDuration,
+			Enum.EasingStyle.Back,
+			Enum.EasingDirection.Out
+		)
+
+		local goalNormal = {Size = UDim2.new(0, 200, 0, 100)}
+		local tweenNormal = TweenService:Create(self.backgroundFrame, tweenInfoBack, goalNormal)
+		tweenNormal:Play()
+	end)
+end
+
+-- Resetar combo
+function ComboController:resetCombo()
+	print("Combo resetado: " .. self.currentCombo.hits .. " hits, " .. self.currentCombo.damage .. " damage total")
+
+	-- Fade out da UI
+	if self.backgroundFrame then
+		local tweenInfo = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		local goal = {BackgroundTransparency = 1}
+		local tween = TweenService:Create(self.backgroundFrame, tweenInfo, goal)
+
+		tween:Play()
+		tween.Completed:Connect(function()
+			if self.comboUI then
+				self.comboUI.Enabled = false
+			end
+			-- Restaurar transparência
+			self.backgroundFrame.BackgroundTransparency = 1 - self.config.Combo.Colors.BackgroundAlpha
+		end)
+	end
+
+	-- Cancelar tween da barra
+	if self.barTween then
+		self.barTween:Cancel()
+	end
+
+	-- Resetar valores
+	self.currentCombo.hits = 0
+	self.currentCombo.damage = 0
+	self.currentCombo.target = nil
+	self.currentCombo.lastHitTime = 0
+end
+
+-- Obter combo atual
+function ComboController:getCurrentCombo()
+	return {
+		hits = self.currentCombo.hits,
+		damage = self.currentCombo.damage
+	}
+end
+
+-- Limpar
+function ComboController:cleanup()
+	if self.timeoutTask then
+		task.cancel(self.timeoutTask)
+	end
+
+	if self.barTween then
+		self.barTween:Cancel()
+	end
+
+	if self.comboUI then
+		self.comboUI:Destroy()
+	end
+
+	print("ComboController limpo")
+end
+
+return ComboController
+-- ConfigModule.lua
+-- Armazene em ReplicatedStorage.Modules.ConfigModule
+
+local ConfigModule = {}
+
+-- IDs de Assets (Animações e Sons)
+ConfigModule.AssetIds = {
+	Sounds = {
+		Punch = "rbxassetid://76982597472712",
+		Run = "rbxassetid://92938939400670"
+	},
+	Animations = {
+		PunchL = "rbxassetid://95636977944297",
+		PunchR = "rbxassetid://138971230416634",
+		KickL = "rbxassetid://100208056502677",
+		StrongPunch = "rbxassetid://115298741511748",
+		Run = "rbxassetid://108797178552016",
+		Dab = "rbxassetid://78363295843908",
+		Hype = "rbxassetid://137854896296291"
+	},
+	Images = {
+		Attack = "rbxassetid://91491122820892",
+		Run = "rbxassetid://110065039106838"
+	}
+}
+
+-- Configurações de Ataques
+ConfigModule.AttackConfigs = {
+	{
+		type = "PunchL",
+		limb = "LeftHand",
+		threshold = 30,
+		color = Color3.fromRGB(100, 100, 100),
+		image = "rbxassetid://91491122820892"
+	},
+	{
+		type = "PunchR",
+		limb = "RightHand",
+		threshold = 50,
+		color = Color3.fromRGB(100, 100, 100),
+		image = "rbxassetid://91491122820892"
+	},
+	{
+		type = "KickL",
+		limb = "LeftFoot",
+		threshold = 70,
+		color = Color3.fromRGB(100, 100, 100),
+		image = "rbxassetid://91491122820892"
+	},
+	{
+		type = "StrongPunch",
+		limb = "RightHand",
+		threshold = 80,
+		color = Color3.fromRGB(100, 100, 100),
+		image = "rbxassetid://91491122820892"
+	}
+}
+
+-- Configurações de Ações Laterais
+ConfigModule.SideDiamondConfigs = {
+	{
+		type = "Run",
+		threshold = 20,
+		color = Color3.fromRGB(255, 165, 0),
+		image = "rbxassetid://110065039106838"
+	},
+	{
+		type = "Dab",
+		threshold = 10,
+		color = Color3.fromRGB(255, 105, 180),
+		image = "rbxassetid://91491122820892"
+	},
+	{
+		type = "Hype",
+		threshold = 10,
+		color = Color3.fromRGB(75, 0, 130),
+		image = "rbxassetid://91491122820892"
+	}
+}
+
+-- Configurações de Gameplay
+ConfigModule.GameplaySettings = {
+	StaminaRegenRate = 5,
+	DiamondSize = 45,
+	SmallDiamondSize = 25,
+	Padding = 5
+}
+
+-- Configurações de Combo
+ConfigModule.Combo = {
+	Enabled = true,
+	TimeoutDuration = 3, -- Segundos até resetar combo
+	ShowUI = true,
+	UIPosition = UDim2.new(0.5, 0, 0.15, 0), -- Centro-superior
+
+	-- Cores da UI
+	Colors = {
+		Background = Color3.fromRGB(20, 20, 20),
+		BackgroundAlpha = 0.7,
+		HitsText = Color3.fromRGB(255, 200, 50),
+		DamageText = Color3.fromRGB(255, 100, 100),
+		BarFull = Color3.fromRGB(255, 200, 50),
+		BarEmpty = Color3.fromRGB(60, 60, 60)
+	},
+
+	-- Animação
+	PopAnimation = true,
+	PopScale = 1.2,
+	PopDuration = 0.1
+}
+
+-- Configurações de Double Jump
+ConfigModule.DoubleJump = {
+	Enabled = true,
+	AnimationId = "rbxassetid://114210321244989",
+	Cooldown = 0.2, -- Tempo entre tentativas de pulo
+	StaminaCost = 15, -- Custo de stamina (0 para desabilitar)
+	DelayAfterFirstJump = 0.1, -- Tempo de espera após primeiro pulo para permitir double jump
+	AllowDuringFall = true -- Permite double jump no início da queda (após subida)
+}
+
+-- Configurações de Fireball
+ConfigModule.Fireball = {
+	Enabled = true,
+	ManaCost = 20,
+	Cooldown = 1.5,
+	ActivationKey = Enum.KeyCode.F,
+	AnimationId = "rbxassetid://95636977944297",
+	CatchSoundId = "rbxassetid://116304548955191", -- Substitua pelo ID do seu som
+	ThrowSoundId = "rbxassetid://116304548955191", -- Substitua pelo ID do seu som
+	HitSoundId = "rbxassetid://116304548955191" -- Substitua pelo ID do seu som
+}
+
+-- Configurações de UI
+ConfigModule.UISettings = {
+	Colors = {
+		Level = Color3.fromRGB(128, 128, 128),
+		LevelFill = Color3.fromRGB(255, 255, 255),
+		Health = Color3.fromRGB(255, 50, 50),
+		HealthFill = Color3.fromRGB(100, 255, 100),
+		Mana = Color3.fromRGB(50, 50, 255),
+		ManaFill = Color3.fromRGB(100, 100, 255),
+		Stamina = Color3.fromRGB(128, 128, 128),
+		StaminaFill = Color3.fromRGB(255, 100, 100),
+		Text = Color3.fromRGB(255, 255, 255)
+	},
+	Positions = {
+		MainFrame = UDim2.new(0, 10, 0, 10),
+		StaminaFrame = UDim2.new(1, -220, 0, 100),
+		RightDiamondsFrame = UDim2.new(1, -60, 0.5, -100)
+	}
+}
+
+return ConfigModule
+-- DefenseController.lua (ATUALIZADO)
+-- Armazene em ReplicatedStorage.Modules.DefenseController
+
+local UserInputService = game:GetService("UserInputService")
+local ContentProvider = game:GetService("ContentProvider")
+
+local DefenseController = {}
+DefenseController.__index = DefenseController
+
+function DefenseController.new(player, humanoid, guiManager, defenseEvent, config)
+	local self = setmetatable({}, DefenseController)
+
+	self.player = player
+	self.humanoid = humanoid
+	self.guiManager = guiManager
+	self.defenseEvent = defenseEvent
+	self.config = config
+
+	-- Estados
+	self.currentState = config.DefenseState.None
+	self.isBlocking = false
+	self.isDashing = false
+	self.canDash = true
+	self.canParry = true
+
+	-- Dash tracking
+	self.lastKeyPress = nil
+	self.lastKeyPressTime = 0
+	self.dashButtonPressed = false -- NOVO: Botão de dash pressionado
+
+	-- Animações
+	self.loadedDashes = {}
+	self.blockAnimation = nil
+	self.parryAnimation = nil
+
+	-- Carregar animações
+	self:loadAnimations()
+
+	-- Setup inputs
+	self:setupInputs()
+
+	-- NOVO: Conectar botões da GUI
+	self:setupGUIButtons()
+
+	print("DefenseController inicializado")
+
+	return self
+end
+
+-- Carregar animações
+function DefenseController:loadAnimations()
+	local animator = self.humanoid:FindFirstChild("Animator")
+	if not animator then
+		warn("Animator não encontrado para DefenseController")
+		return
+	end
+
+	-- Preload dash animations
+	local assetsToPreload = {}
+	for key, dashConfig in pairs(self.config.Dash.Directions) do
+		table.insert(assetsToPreload, dashConfig.animationId)
+	end
+	ContentProvider:PreloadAsync(assetsToPreload)
+
+	-- Load dash animations
+	for key, dashConfig in pairs(self.config.Dash.Directions) do
+		local animation = Instance.new("Animation")
+		animation.AnimationId = dashConfig.animationId
+		local track = animator:LoadAnimation(animation)
+
+		self.loadedDashes[key] = {
+			animation = track,
+			direction = dashConfig.direction,
+			name = dashConfig.name
+		}
+	end
+
+	print("Animações de defesa carregadas")
+end
+
+-- NOVO: Conectar botões da GUI
+function DefenseController:setupGUIButtons()
+	-- Botão de Defesa/Parry
+	local defenseButton = self.guiManager:getDefenseButton()
+	if defenseButton and defenseButton.Frame then
+		defenseButton.Frame.Activated:Connect(function()
+			self:tryParry()
+		end)
+		print("Botão de Defesa conectado")
+	end
+
+	-- Botão de Dash/Esquiva
+	local dashButton = self.guiManager:getDashButton()
+	if dashButton and dashButton.Frame then
+		-- Mouse Down
+		dashButton.Frame.MouseButton1Down:Connect(function()
+			self.dashButtonPressed = true
+			print("Botão de Dash pressionado")
+		end)
+
+		-- Mouse Up
+		dashButton.Frame.MouseButton1Up:Connect(function()
+			self.dashButtonPressed = false
+			print("Botão de Dash solto")
+		end)
+
+		print("Botão de Dash conectado")
+	end
+end
+
+-- Setup inputs
+function DefenseController:setupInputs()
+	-- Input começou
+	UserInputService.InputBegan:Connect(function(input, isProcessed)
+		if isProcessed then return end
+
+		self:handleInputBegan(input)
+	end)
+
+	-- Input terminou
+	UserInputService.InputEnded:Connect(function(input, isProcessed)
+		if isProcessed then return end
+
+		self:handleInputEnded(input)
+	end)
+end
+
+-- Handle input começou
+function DefenseController:handleInputBegan(input)
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+	-- PARRY (Q)
+	if input.KeyCode == self.config.Parry.ActivationKey then
+		self:tryParry()
+		return
+	end
+
+	-- BLOCK (Shift - Segurar)
+	if input.KeyCode == self.config.Block.ActivationKey then
+		self:startBlocking()
+		return
+	end
+
+	-- DASH (W, A, S, D - SOMENTE se botão de dash estiver pressionado)
+	local key = nil
+	if input.KeyCode == Enum.KeyCode.W then key = "W"
+	elseif input.KeyCode == Enum.KeyCode.A then key = "A"
+	elseif input.KeyCode == Enum.KeyCode.S then key = "S"
+	elseif input.KeyCode == Enum.KeyCode.D then key = "D"
+	end
+
+	if key and self.dashButtonPressed then
+		-- Executar dash imediatamente com a direção
+		self:tryDash(key)
+	end
+end
+
+-- Handle input terminou
+function DefenseController:handleInputEnded(input)
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+	-- BLOCK (Shift - Soltar)
+	if input.KeyCode == self.config.Block.ActivationKey then
+		self:stopBlocking()
+	end
+end
+
+-- Executar Dash
+function DefenseController:tryDash(key)
+	if not self.canDash or self.isDashing then
+		print("Dash: Não disponível")
+		return
+	end
+
+	-- Verificar stamina
+	local staminaValue = self.humanoid:FindFirstChild("Stamina")
+	if not staminaValue or staminaValue.Value < self.config.Dash.StaminaCost then
+		print("Dash: Stamina insuficiente")
+		return
+	end
+
+	-- Verificar se está vivo
+	if self.humanoid.Health <= 0 then
+		return
+	end
+
+	local dash = self.loadedDashes[key]
+	if not dash then
+		warn("Dash não encontrado para tecla: " .. key)
+		return
+	end
+
+	-- Marcar como dashing
+	self.isDashing = true
+	self.canDash = false
+	self.currentState = self.config.DefenseState.Dashing
+
+	-- Tocar animação
+	dash.animation:Play()
+
+	-- Enviar ao servidor
+	self.defenseEvent:FireServer("Dash", key)
+
+	print("Dash executado: " .. dash.name)
+
+	-- Aguardar fim da animação
+	task.spawn(function()
+		dash.animation.Stopped:Wait()
+		self.isDashing = false
+		self.currentState = self.config.DefenseState.None
+	end)
+
+	-- Cooldown
+	task.delay(self.config.Dash.Cooldown, function()
+		self.canDash = true
+		print("Dash: Cooldown resetado")
+	end)
+end
+
+-- Começar a bloquear
+function DefenseController:startBlocking()
+	if self.isBlocking then return end
+
+	-- Verificar se está vivo
+	if self.humanoid.Health <= 0 then
+		return
+	end
+
+	self.isBlocking = true
+	self.currentState = self.config.DefenseState.Blocking
+
+	-- Enviar ao servidor
+	self.defenseEvent:FireServer("BlockStart")
+
+	print("Block ativado")
+end
+
+-- Parar de bloquear
+function DefenseController:stopBlocking()
+	if not self.isBlocking then return end
+
+	self.isBlocking = false
+	self.currentState = self.config.DefenseState.None
+
+	-- Enviar ao servidor
+	self.defenseEvent:FireServer("BlockEnd")
+
+	print("Block desativado")
+end
+
+-- Tentar Parry
+function DefenseController:tryParry()
+	if not self.canParry then
+		print("Parry: Em cooldown")
+		return
+	end
+
+	-- Verificar stamina
+	local staminaValue = self.humanoid:FindFirstChild("Stamina")
+	if not staminaValue or staminaValue.Value < self.config.Parry.StaminaCost then
+		print("Parry: Stamina insuficiente")
+		return
+	end
+
+	-- Verificar se está vivo
+	if self.humanoid.Health <= 0 then
+		return
+	end
+
+	self.canParry = false
+	self.currentState = self.config.DefenseState.ParryWindow
+
+	-- Enviar ao servidor
+	self.defenseEvent:FireServer("Parry")
+
+	print("Parry ativado - Janela de " .. self.config.Parry.WindowDuration .. "s")
+
+	-- Janela de parry
+	task.delay(self.config.Parry.WindowDuration, function()
+		if self.currentState == self.config.DefenseState.ParryWindow then
+			self.currentState = self.config.DefenseState.None
+			print("Parry: Janela expirou")
+		end
+	end)
+
+	-- Cooldown
+	task.delay(self.config.Parry.Cooldown, function()
+		self.canParry = true
+		print("Parry: Cooldown resetado")
+	end)
+end
+
+-- Obter estado atual
+function DefenseController:getState()
+	return self.currentState
+end
+
+-- Verificar se está defendendo
+function DefenseController:isDefending()
+	return self.isBlocking or 
+		self.isDashing or 
+		self.currentState == self.config.DefenseState.ParryWindow
+end
+
+-- Limpar
+function DefenseController:cleanup()
+	self.currentState = self.config.DefenseState.None
+	self.isBlocking = false
+	self.isDashing = false
+	self.canDash = true
+	self.canParry = true
+	self.dashButtonPressed = false
+
+	print("DefenseController limpo")
+end
+
+return DefenseController
+-- DefenseSystemConfig.lua
+-- Armazene em ReplicatedStorage.Modules.DefenseSystemConfig
+
+local DefenseSystemConfig = {}
+
+-- Configurações de Dash/Esquiva
+DefenseSystemConfig.Dash = {
+	Enabled = true,
+
+	-- Mecânica
+	Speed = 100,
+	Duration = 0.25,
+	Cooldown = 0.5,
+	FlickInterval = 0.3, -- Tempo para duplo clique
+
+	-- I-Frames (Invencibilidade)
+	IFramesDuration = 0.3, -- Invencível por 0.3s durante dash
+
+	-- Custos
+	StaminaCost = 15,
+
+	-- Direções disponíveis
+	Directions = {
+		W = {
+			animationId = "rbxassetid://114210321244989",
+			direction = Vector3.new(0, 0, -1),
+			name = "Frente"
+		},
+		A = {
+			animationId = "rbxassetid://112201729432533",
+			direction = Vector3.new(-1, 0, 0),
+			name = "Esquerda"
+		},
+		D = {
+			animationId = "rbxassetid://131883625044274",
+			direction = Vector3.new(1, 0, 0),
+			name = "Direita"
+		},
+		S = {
+			animationId = "rbxassetid://114210321244989", -- Mesmo da frente (reverso)
+			direction = Vector3.new(0, 0, 1),
+			name = "Trás"
+		}
+	}
+}
+
+-- Configurações de Defesa (Block)
+DefenseSystemConfig.Block = {
+	Enabled = true,
+
+	-- Mecânica
+	ActivationKey = Enum.KeyCode.LeftShift, -- Segurar Shift
+	DamageReduction = 0.5, -- 50% de redução
+	StaminaDrainPerHit = 10, -- Stamina perdida ao bloquear hit
+
+	-- Movimento
+	MovementSpeedMultiplier = 0.5, -- 50% da velocidade normal
+
+	-- Visual
+	BlockStance = true, -- Mostra stance de defesa
+	EffectColor = Color3.fromRGB(100, 150, 255)
+}
+
+-- Configurações de Parry
+DefenseSystemConfig.Parry = {
+	Enabled = true,
+
+	-- Mecânica
+	ActivationKey = Enum.KeyCode.Q, -- Pressionar Q
+	WindowDuration = 0.2, -- Janela de 0.2s para acertar o timing
+	Cooldown = 2, -- 2s de cooldown
+
+	-- Efeitos no atacante
+	StunDuration = 1.5, -- Atacante fica atordoado por 1.5s
+	DisarmDuration = 1.5, -- Desarmado (sem atacar) por 1.5s
+
+	-- Custos e recompensas
+	StaminaCost = 20,
+	StaminaRecovery = 30, -- Recupera stamina ao acertar parry
+
+	-- Visual
+	SuccessColor = Color3.fromRGB(255, 215, 0), -- Dourado
+	FailColor = Color3.fromRGB(255, 50, 50), -- Vermelho
+	EffectDuration = 0.3
+}
+
+-- Sistema de redução de dano por tipo de defesa
+DefenseSystemConfig.DamageReduction = {
+	-- Sem defesa
+	None = 1.0, -- 100% do dano
+
+	-- Dash (I-Frames)
+	Dash = 0.0, -- 0% do dano (invencível)
+
+	-- Block
+	Block = 0.5, -- 50% do dano
+
+	-- Parry (timing perfeito)
+	Parry = 0.0, -- 0% do dano + contra-ataque
+
+	-- Parry falho
+	ParryFail = 1.2 -- 120% do dano (punição por errar)
+}
+
+-- Estados de defesa possíveis
+DefenseSystemConfig.DefenseState = {
+	None = "None",
+	Dashing = "Dashing",
+	Blocking = "Blocking",
+	ParryWindow = "ParryWindow",
+	ParrySuccess = "ParrySuccess",
+	ParryFail = "ParryFail",
+	Stunned = "Stunned"
+}
+
+return DefenseSystemConfig
+-- DoubleJumpController.lua
+-- Armazene em ReplicatedStorage.Modules.DoubleJumpController
+
+local UserInputService = game:GetService("UserInputService")
+
+local DoubleJumpController = {}
+DoubleJumpController.__index = DoubleJumpController
+
+function DoubleJumpController.new(humanoid, animationManager, config)
+	local self = setmetatable({}, DoubleJumpController)
+
+	self.humanoid = humanoid
+	self.animationManager = animationManager
+	self.config = config
+
+	-- Estados do double jump
+	self.doubleJumpReady = true
+	self.canDoubleJump = false
+	self.didDoubleJump = false
+
+	-- Carregar animação
+	self:loadAnimation()
+
+	-- Conectar eventos
+	self:setupListeners()
+
+	print("DoubleJumpController inicializado")
+
+	return self
+end
+
+-- Carregar animação de double jump
+function DoubleJumpController:loadAnimation()
+	if not self.config.DoubleJump.Enabled then
+		return
+	end
+
+	local animation = Instance.new("Animation")
+	animation.AnimationId = self.config.DoubleJump.AnimationId
+
+	local animator = self.humanoid:FindFirstChild("Animator")
+	if animator then
+		self.doubleJumpTrack = animator:LoadAnimation(animation)
+		print("Animação de Double Jump carregada")
+	else
+		warn("Animator não encontrado para Double Jump")
+	end
+end
+
+-- Configurar listeners de eventos
+function DoubleJumpController:setupListeners()
+	-- Listener de mudança de estado do humanoid
+	self.stateConnection = self.humanoid.StateChanged:Connect(function(_, newState)
+		self:onStateChanged(newState)
+	end)
+
+	-- Listener de pulo (JumpRequest) - só processa se pode fazer double jump
+	self.jumpConnection = UserInputService.JumpRequest:Connect(function()
+		print("🎮 JumpRequest detectado - canDoubleJump: " .. tostring(self.canDoubleJump))
+		if self.canDoubleJump then
+			print("✅ Tentando double jump...")
+			self:tryDoubleJump()
+		else
+			print("⛔ Double jump não disponível")
+		end
+	end)
+end
+
+-- Tentar executar double jump
+function DoubleJumpController:tryDoubleJump()
+	print("=== tryDoubleJump chamado ===")
+	print("  - Enabled: " .. tostring(self.config.DoubleJump.Enabled))
+	print("  - doubleJumpReady: " .. tostring(self.doubleJumpReady))
+	print("  - canDoubleJump: " .. tostring(self.canDoubleJump))
+	print("  - didDoubleJump: " .. tostring(self.didDoubleJump))
+	print("  - Estado atual: " .. tostring(self.humanoid:GetState()))
+
+	if not self.config.DoubleJump.Enabled then
+		print("  → Double Jump desabilitado no config")
+		return false
+	end
+
+	if not self.doubleJumpReady then
+		print("  → Cooldown ativo")
+		return false
+	end
+
+	-- Verificar se pode fazer double jump
+	if not self.canDoubleJump or self.didDoubleJump then
+		print("  → Não pode fazer double jump (canDoubleJump: " .. tostring(self.canDoubleJump) .. ", didDoubleJump: " .. tostring(self.didDoubleJump) .. ")")
+		return false
+	end
+
+	-- Verificar se está vivo
+	if self.humanoid.Health <= 0 then
+		print("  → Jogador morto")
+		return false
+	end
+
+	-- Verificar stamina (se configurado)
+	local staminaCost = self.config.DoubleJump.StaminaCost
+	if staminaCost > 0 then
+		local staminaValue = self.humanoid:FindFirstChild("Stamina")
+		if not staminaValue or staminaValue.Value < staminaCost then
+			print("  → Stamina insuficiente (" .. (staminaValue and staminaValue.Value or 0) .. "/" .. staminaCost .. ")")
+			return false
+		end
+
+		-- Consumir stamina
+		staminaValue.Value = math.max(staminaValue.Value - staminaCost, 0)
+		print("  → Stamina consumida: " .. staminaCost)
+	end
+
+	-- Executar double jump
+	self:executeDoubleJump()
+
+	return true
+end
+
+-- Executar o double jump
+function DoubleJumpController:executeDoubleJump()
+	-- Garantir que só executa uma vez
+	if self.didDoubleJump then
+		print("Double Jump: Já foi usado neste pulo")
+		return
+	end
+
+	self.doubleJumpReady = false
+	self.didDoubleJump = true
+	self.canDoubleJump = false -- IMPORTANTE: Desabilitar IMEDIATAMENTE
+
+	print("⚠️ Double Jump USADO - Flags atualizadas:")
+	print("  - didDoubleJump: " .. tostring(self.didDoubleJump))
+	print("  - canDoubleJump: " .. tostring(self.canDoubleJump))
+
+	-- Mudar estado para pulo
+	self.humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+
+	-- Tocar animação
+	if self.doubleJumpTrack then
+		self.doubleJumpTrack:Play()
+	end
+
+	print("✨ Double Jump executado!")
+
+	-- Aplicar cooldown
+	task.delay(self.config.DoubleJump.Cooldown, function()
+		self.doubleJumpReady = true
+		print("⏰ Cooldown do Double Jump resetado (mas didDoubleJump ainda true até aterrissar)")
+	end)
+end
+
+-- Gerenciar mudanças de estado do humanoid
+function DoubleJumpController:onStateChanged(newState)
+	print("🔄 Estado mudou para: " .. tostring(newState) .. " | didDoubleJump: " .. tostring(self.didDoubleJump))
+
+	if newState == Enum.HumanoidStateType.Landed then
+		-- Aterrissou - resetar double jump
+		self.canDoubleJump = false
+		self.didDoubleJump = false
+		print("🏁 Double Jump: Estado resetado (aterrissou)")
+		print("  - canDoubleJump: false")
+		print("  - didDoubleJump: false")
+
+	elseif newState == Enum.HumanoidStateType.Jumping then
+		-- Começou a pular
+
+		-- Se didDoubleJump ainda for true, significa que é o double jump sendo executado
+		if self.didDoubleJump then
+			print("🔁 Double Jump sendo executado (ignora)")
+			return
+		end
+
+		-- É um NOVO pulo do chão - resetar flags
+		self.canDoubleJump = false
+		self.didDoubleJump = false
+		print("🚀 Double Jump: Primeiro pulo iniciado")
+
+		-- Aguardar um período para permitir double jump
+		local delay = self.config.DoubleJump.DelayAfterFirstJump or 0.1
+		task.delay(delay, function()
+			-- Só habilita se ainda não usou
+			if not self.didDoubleJump then
+				local currentState = self.humanoid:GetState()
+
+				-- Permite tanto em Jumping quanto em Freefall inicial
+				if currentState == Enum.HumanoidStateType.Jumping or 
+					currentState == Enum.HumanoidStateType.Freefall then
+					self.canDoubleJump = true
+					print("✅ Double Jump: Disponível (Estado: " .. tostring(currentState) .. ")")
+				else
+					print("❌ Double Jump: Estado inválido - " .. tostring(currentState))
+				end
+			else
+				print("⛔ Double Jump: Já foi usado neste ciclo")
+			end
+		end)
+
+	elseif newState == Enum.HumanoidStateType.Freefall then
+		-- Está caindo - NÃO permitir se já usou
+		if self.didDoubleJump then
+			self.canDoubleJump = false
+			print("⛔ Double Jump: Já foi usado - desabilitado na queda")
+		elseif self.canDoubleJump then
+			print("⏳ Double Jump: Mantido disponível durante queda inicial")
+		end
+	end
+end
+
+-- Resetar estados
+function DoubleJumpController:reset()
+	self.doubleJumpReady = true
+	self.canDoubleJump = false
+	self.didDoubleJump = false
+end
+
+-- Habilitar/Desabilitar double jump
+function DoubleJumpController:setEnabled(enabled)
+	self.config.DoubleJump.Enabled = enabled
+
+	if not enabled then
+		self:reset()
+	end
+end
+
+-- Limpar conexões ao destruir
+function DoubleJumpController:cleanup()
+	if self.jumpConnection then
+		self.jumpConnection:Disconnect()
+		self.jumpConnection = nil
+	end
+
+	if self.stateConnection then
+		self.stateConnection:Disconnect()
+		self.stateConnection = nil
+	end
+
+	if self.doubleJumpTrack then
+		self.doubleJumpTrack:Stop()
+		self.doubleJumpTrack = nil
+	end
+
+	print("DoubleJumpController limpo")
+end
+
+return DoubleJumpController
+-- FireballController.lua
+-- Armazene em ReplicatedStorage.Modules.FireballController
+
+local UserInputService = game:GetService("UserInputService")
+
+local FireballController = {}
+FireballController.__index = FireballController
+
+function FireballController.new(player, humanoid, animationManager, fireballEvent, config)
+	local self = setmetatable({}, FireballController)
+
+	self.player = player
+	self.humanoid = humanoid
+	self.animationManager = animationManager
+	self.fireballEvent = fireballEvent
+	self.config = config
+
+	-- Estado
+	self.canCast = true
+	self.isCasting = false
+
+	-- Carregar animação
+	self:loadAnimation()
+
+	-- Configurar input
+	self:setupInput()
+
+	-- Tocar som de equipar
+	self:playCatchSound()
+
+	print("FireballController inicializado")
+
+	return self
+end
+
+-- Carregar animação de fireball
+function FireballController:loadAnimation()
+	local animation = Instance.new("Animation")
+	animation.AnimationId = self.config.Fireball.AnimationId
+
+	local animator = self.humanoid:FindFirstChild("Animator")
+	if animator then
+		self.fireballTrack = animator:LoadAnimation(animation)
+		print("Animação de Fireball carregada")
+	else
+		warn("Animator não encontrado para Fireball")
+	end
+end
+
+-- Tocar som de equipar
+function FireballController:playCatchSound()
+	local catchSound = Instance.new("Sound")
+	catchSound.SoundId = self.config.Fireball.CatchSoundId
+	catchSound.Parent = self.humanoid.Parent
+	catchSound:Play()
+
+	game:GetService("Debris"):AddItem(catchSound, 2)
+end
+
+-- Configurar input
+function FireballController:setupInput()
+	self.inputConnection = UserInputService.InputBegan:Connect(function(input, isTyping)
+		if isTyping then return end
+
+		if input.KeyCode == self.config.Fireball.ActivationKey then
+			self:tryFireball()
+		end
+	end)
+end
+
+-- Tentar lançar fireball
+function FireballController:tryFireball()
+	if not self.canCast or self.isCasting then
+		print("Fireball: Não pode lançar (cooldown ou já lançando)")
+		return
+	end
+
+	-- Verificar se está vivo
+	if self.humanoid.Health <= 0 then
+		print("Fireball: Jogador morto")
+		return
+	end
+
+	-- Verificar mana
+	local manaValue = self.humanoid:FindFirstChild("Mana")
+	if not manaValue or manaValue.Value < self.config.Fireball.ManaCost then
+		print("Fireball: Mana insuficiente")
+		return
+	end
+
+	-- Obter posição do mouse
+	local mouse = self.player:GetMouse()
+	local mousePosition = mouse.Hit.Position
+
+	-- Marcar como lançando
+	self.isCasting = true
+	self.canCast = false
+
+	-- Tocar animação
+	if self.fireballTrack then
+		self.fireballTrack:Play()
+	end
+
+	-- Enviar ao servidor
+	self.fireballEvent:FireServer(mousePosition)
+
+	print("Fireball lançada!")
+
+	-- Aguardar animação terminar
+	if self.fireballTrack then
+		self.fireballTrack.Stopped:Wait()
+	else
+		task.wait(0.5)
+	end
+
+	self.isCasting = false
+
+	-- Aplicar cooldown
+	task.delay(self.config.Fireball.Cooldown, function()
+		self.canCast = true
+		print("Fireball: Cooldown resetado")
+	end)
+end
+
+-- Limpar
+function FireballController:cleanup()
+	if self.inputConnection then
+		self.inputConnection:Disconnect()
+	end
+
+	if self.fireballTrack then
+		self.fireballTrack:Stop()
+	end
+
+	print("FireballController limpo")
+end
+
+return FireballController
+-- GUIManager.lua
+-- Armazene em ReplicatedStorage.Modules.GUIManager
+
+local GUIManager = {}
+GUIManager.__index = GUIManager
+
+function GUIManager.new(player, humanoid, configModule)
+	local self = setmetatable({}, GUIManager)
+
+	self.player = player
+	self.humanoid = humanoid
+	self.config = configModule
+	self.diamonds = {}
+	self.defenseButton = nil
+	self.dashButton = nil
+
+	self:createGUI()
+	self:setupUpdateListeners()
+
+	return self
+end
+
+function GUIManager:createGUI()
+	-- Criar ScreenGui
+	self.gui = Instance.new("ScreenGui")
+	self.gui.Name = "PlayerGUI"
+	self.gui.Enabled = true
+	self.gui.ResetOnSpawn = true
+	self.gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	self.gui.Parent = self.player:WaitForChild("PlayerGui")
+
+	self:createMainFrame()
+	self:createStaminaFrame()
+	self:createRightDiamondsFrame()
+	self:createDefenseButtons() -- NOVO
+
+	print("GUI criada com sucesso")
+end
+
+function GUIManager:createMainFrame()
+	local colors = self.config.UISettings.Colors
+
+	self.mainFrame = Instance.new("Frame")
+	self.mainFrame.Name = "MainFrame"
+	self.mainFrame.Size = UDim2.new(0, 150, 0, 120)
+	self.mainFrame.Position = self.config.UISettings.Positions.MainFrame
+	self.mainFrame.BackgroundTransparency = 1
+	self.mainFrame.ZIndex = 1
+	self.mainFrame.Parent = self.gui
+
+	-- Barra de Nível
+	self:createStatBar("Level", UDim2.new(0, 0, 0, 0), colors.Level, colors.LevelFill)
+
+	-- Barra de Vida
+	self:createStatBar("Health", UDim2.new(0, 0, 0, 20), colors.Health, colors.HealthFill)
+
+	-- Barra de Mana
+	self:createStatBar("Mana", UDim2.new(0, 0, 0, 40), colors.Mana, colors.ManaFill)
+end
+
+function GUIManager:createStatBar(statName, position, bgColor, fillColor)
+	local frame = Instance.new("Frame")
+	frame.Name = statName .. "Frame"
+	frame.Size = UDim2.new(1, 0, 0, 5)
+	frame.Position = position
+	frame.BackgroundColor3 = bgColor
+	frame.ZIndex = 2
+	frame.Parent = self.mainFrame
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = frame
+
+	local bar = Instance.new("Frame")
+	bar.Name = statName .. "Bar"
+	bar.Size = UDim2.new(1, 0, 1, 0)
+	bar.BackgroundColor3 = fillColor
+	bar.ZIndex = 3
+	bar.Parent = frame
+
+	local barCorner = Instance.new("UICorner")
+	barCorner.CornerRadius = UDim.new(1, 0)
+	barCorner.Parent = bar
+
+	local text = Instance.new("TextLabel")
+	text.Name = statName .. "Text"
+	text.Size = UDim2.new(1, 0, 0, 11)
+	text.Position = UDim2.new(0, 0, 1.2, 0)
+	text.BackgroundTransparency = 1
+	text.TextColor3 = self.config.UISettings.Colors.Text
+	text.TextScaled = true
+	text.ZIndex = 4
+	text.Parent = frame
+
+	self[statName:lower() .. "Frame"] = frame
+	self[statName:lower() .. "Bar"] = bar
+	self[statName:lower() .. "Text"] = text
+end
+
+function GUIManager:createStaminaFrame()
+	self.staminaFrame = Instance.new("Frame")
+	self.staminaFrame.Name = "StaminaFrame"
+	self.staminaFrame.Size = UDim2.new(0, 120, 0, 160)
+	self.staminaFrame.Position = self.config.UISettings.Positions.StaminaFrame
+	self.staminaFrame.BackgroundTransparency = 1
+	self.staminaFrame.ZIndex = 1
+	self.staminaFrame.Parent = self.gui
+
+	-- Barra de Stamina
+	local colors = self.config.UISettings.Colors
+	local staminaBarFrame = Instance.new("Frame")
+	staminaBarFrame.Name = "StaminaBarFrame"
+	staminaBarFrame.Size = UDim2.new(1, 0, 0, 5)
+	staminaBarFrame.Position = UDim2.new(0, 25, 0, 190)
+	staminaBarFrame.BackgroundColor3 = colors.Stamina
+	staminaBarFrame.ZIndex = 2
+	staminaBarFrame.Parent = self.staminaFrame
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = staminaBarFrame
+
+	self.staminaBar = Instance.new("Frame")
+	self.staminaBar.Name = "StaminaBar"
+	self.staminaBar.Size = UDim2.new(1, 0, 1, 0)
+	self.staminaBar.BackgroundColor3 = colors.StaminaFill
+	self.staminaBar.ZIndex = 3
+	self.staminaBar.Parent = staminaBarFrame
+
+	local barCorner = Instance.new("UICorner")
+	barCorner.CornerRadius = UDim.new(1, 0)
+	barCorner.Parent = self.staminaBar
+
+	self.staminaText = Instance.new("TextLabel")
+	self.staminaText.Name = "StaminaText"
+	self.staminaText.Size = UDim2.new(1, 0, 0, 11)
+	self.staminaText.Position = UDim2.new(0, 25, 0, 175)
+	self.staminaText.BackgroundTransparency = 1
+	self.staminaText.TextColor3 = colors.Text
+	self.staminaText.TextScaled = true
+	self.staminaText.ZIndex = 4
+	self.staminaText.Parent = self.staminaFrame
+end
+
+function GUIManager:createRightDiamondsFrame()
+	self.rightDiamondsFrame = Instance.new("Frame")
+	self.rightDiamondsFrame.Name = "RightDiamondsFrame"
+	self.rightDiamondsFrame.Size = UDim2.new(0, 50, 0, 200)
+	self.rightDiamondsFrame.Position = self.config.UISettings.Positions.RightDiamondsFrame
+	self.rightDiamondsFrame.BackgroundTransparency = 1
+	self.rightDiamondsFrame.ZIndex = 1
+	self.rightDiamondsFrame.Parent = self.gui
+end
+
+-- NOVO: Criar botões de defesa/parry e dash/esquiva
+function GUIManager:createDefenseButtons()
+	local diamondSize = self.config.GameplaySettings.DiamondSize
+	local padding = self.config.GameplaySettings.Padding
+	local offset = (diamondSize / 1.414) + padding
+
+	-- Botão de DEFESA/PARRY (Sudoeste - inferior esquerda)
+	local defensePosition = UDim2.new(0.3, -offset, 0.7, offset)
+
+	self.defenseButton = self:createDiamond(
+		self.staminaFrame,
+		defensePosition,
+		diamondSize * 0.8, -- Ligeiramente menor
+		Color3.fromRGB(100, 150, 255), -- Azul
+		"rbxassetid://91491122820892", -- Ícone de escudo
+		20, -- Threshold de stamina
+		"Defense",
+		nil,
+		function()
+			-- Callback será conectado no DefenseController
+			print("Botão de Defesa/Parry pressionado")
+		end
+	)
+
+	-- Label do botão
+	local defenseLabel = Instance.new("TextLabel")
+	defenseLabel.Name = "DefenseLabel"
+	defenseLabel.Size = UDim2.new(1.5, 0, 0.3, 0)
+	defenseLabel.Position = UDim2.new(0.5, 0, 1.2, 0)
+	defenseLabel.AnchorPoint = Vector2.new(0.5, 0)
+	defenseLabel.BackgroundTransparency = 1
+	defenseLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	defenseLabel.TextScaled = true
+	defenseLabel.Font = Enum.Font.GothamBold
+	defenseLabel.Text = "Q"
+	defenseLabel.Rotation = 315
+	defenseLabel.ZIndex = 5
+	defenseLabel.Parent = self.defenseButton.Frame
+
+	-- Botão de DASH/ESQUIVA (Nordeste - superior direita)
+	local dashPosition = UDim2.new(0.7, offset, 0.4, -offset)
+
+	self.dashButton = self:createDiamond(
+		self.staminaFrame,
+		dashPosition,
+		diamondSize * 0.8, -- Ligeiramente menor
+		Color3.fromRGB(255, 165, 0), -- Laranja
+		"rbxassetid://91491122820892", -- Ícone de dash
+		15, -- Threshold de stamina
+		"Dash",
+		nil,
+		function()
+			-- Callback será conectado no DefenseController
+			print("Botão de Dash/Esquiva pressionado")
+		end
+	)
+
+	-- Label do botão
+	local dashLabel = Instance.new("TextLabel")
+	dashLabel.Name = "DashLabel"
+	dashLabel.Size = UDim2.new(1.5, 0, 0.3, 0)
+	dashLabel.Position = UDim2.new(0.5, 0, 1.2, 0)
+	dashLabel.AnchorPoint = Vector2.new(0.5, 0)
+	dashLabel.BackgroundTransparency = 1
+	dashLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	dashLabel.TextScaled = true
+	dashLabel.Font = Enum.Font.GothamBold
+	dashLabel.Text = "W/A/S/D"
+	dashLabel.Rotation = 315
+	dashLabel.ZIndex = 5
+	dashLabel.Parent = self.dashButton.Frame
+
+	print("Botões de defesa criados")
+end
+
+function GUIManager:createDiamond(parent, position, size, color, imageId, threshold, actionType, limb, onActivated)
+	local diamond = Instance.new("ImageButton")
+	diamond.Name = "Diamond_" .. actionType
+	diamond.Size = UDim2.new(0, size, 0, size)
+	diamond.Position = position
+	diamond.BackgroundColor3 = color
+	diamond.Rotation = 45
+	diamond.BackgroundTransparency = 0.5
+	diamond.ZIndex = 2
+	diamond.Parent = parent
+
+	local uiCorner = Instance.new("UICorner")
+	uiCorner.CornerRadius = UDim.new(0, 5)
+	uiCorner.Parent = diamond
+
+	local diamondImage = Instance.new("ImageLabel")
+	diamondImage.Name = "DiamondImage"
+	diamondImage.Size = UDim2.new(0.9, 0, 0.9, 0)
+	diamondImage.Position = UDim2.new(0.5, 0, 0.5, 0)
+	diamondImage.AnchorPoint = Vector2.new(0.5, 0.5)
+	diamondImage.BackgroundTransparency = 1
+	diamondImage.Image = imageId
+	diamondImage.ImageTransparency = 0.5
+	diamondImage.ZIndex = 3
+	diamondImage.Rotation = 315
+	diamondImage.Parent = diamond
+
+	local timerLabel = Instance.new("TextLabel")
+	timerLabel.Name = "TimerLabel"
+	timerLabel.Size = UDim2.new(0.8, 0, 0.8, 0)
+	timerLabel.Position = UDim2.new(0.5, 0, 0.5, 0)
+	timerLabel.AnchorPoint = Vector2.new(0.5, 0.5)
+	timerLabel.BackgroundTransparency = 1
+	timerLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	timerLabel.TextScaled = true
+	timerLabel.Text = ""
+	timerLabel.Rotation = 315
+	timerLabel.ZIndex = 4
+	timerLabel.Parent = diamond
+
+	diamond.Activated:Connect(function()
+		onActivated(actionType, limb, threshold)
+	end)
+
+	local diamondData = {
+		Frame = diamond,
+		Image = diamondImage,
+		Timer = timerLabel,
+		Threshold = threshold
+	}
+
+	table.insert(self.diamonds, diamondData)
+	return diamondData
+end
+
+function GUIManager:updateGUI()
+	local leaderstats = self.player:FindFirstChild("leaderstats")
+
+	-- Atualizar Nível e XP
+	if leaderstats then
+		local levelValue = leaderstats:FindFirstChild("Level")
+		local xpValue = leaderstats:FindFirstChild("XP")
+
+		if levelValue and xpValue then
+			local xpParaProximoNivel = levelValue.Value * 100
+			local xpPercent = xpValue.Value / xpParaProximoNivel
+			self.levelText.Text = "Nível: " .. levelValue.Value
+			self.levelBar.Size = UDim2.new(math.clamp(xpPercent, 0, 1), 0, 1, 0)
+		end
+	else
+		self.levelText.Text = "Nível: Carregando..."
+		self.levelBar.Size = UDim2.new(0, 0, 1, 0)
+	end
+
+	-- Atualizar Vida
+	local healthPercent = self.humanoid.Health / self.humanoid.MaxHealth
+	self.healthBar.Size = UDim2.new(math.clamp(healthPercent, 0, 1), 0, 1, 0)
+	self.healthText.Text = "Vida: " .. math.floor(self.humanoid.Health) .. "/" .. math.floor(self.humanoid.MaxHealth)
+
+	-- Atualizar Mana
+	local manaValue = self.humanoid:FindFirstChild("Mana")
+	if manaValue then
+		local maxMana = 100 + (leaderstats and leaderstats:FindFirstChild("Level") and leaderstats.Level.Value * 10 or 0)
+		local manaPercent = manaValue.Value / maxMana
+		self.manaBar.Size = UDim2.new(math.clamp(manaPercent, 0, 1), 0, 1, 0)
+		self.manaText.Text = "Mana: " .. math.floor(manaValue.Value) .. "/" .. math.floor(maxMana)
+	end
+
+	-- Atualizar Stamina
+	local staminaValue = self.humanoid:FindFirstChild("Stamina")
+	if staminaValue then
+		local maxStamina = 100 + (leaderstats and leaderstats:FindFirstChild("Level") and leaderstats.Level.Value * 10 or 0)
+		local currentStamina = staminaValue.Value
+		local staminaPercent = currentStamina / maxStamina
+		self.staminaBar.Size = UDim2.new(math.clamp(staminaPercent, 0, 1), 0, 1, 0)
+		self.staminaText.Text = "Stamina: " .. math.floor(currentStamina) .. "/" .. math.floor(maxStamina)
+
+		-- Atualizar losangos
+		local regenRate = self.config.GameplaySettings.StaminaRegenRate
+		for _, diamond in ipairs(self.diamonds) do
+			local threshold = diamond.Threshold
+			if currentStamina >= threshold then
+				diamond.Frame.BackgroundTransparency = 0
+				diamond.Image.ImageTransparency = 0
+				diamond.Timer.Text = ""
+			else
+				diamond.Frame.BackgroundTransparency = 0.5
+				diamond.Image.ImageTransparency = 0.5
+				local staminaNeeded = threshold - currentStamina
+				local timeRemaining = math.ceil(staminaNeeded / regenRate)
+				diamond.Timer.Text = timeRemaining > 0 and tostring(timeRemaining) or ""
+			end
+		end
+	end
+end
+
+function GUIManager:setupUpdateListeners()
+	self.humanoid.HealthChanged:Connect(function()
+		self:updateGUI()
+	end)
+
+	local mana = self.humanoid:WaitForChild("Mana", 5)
+	if mana then
+		mana.Changed:Connect(function()
+			self:updateGUI()
+		end)
+	end
+
+	local stamina = self.humanoid:WaitForChild("Stamina", 5)
+	if stamina then
+		stamina.Changed:Connect(function()
+			self:updateGUI()
+		end)
+	end
+
+	local leaderstats = self.player:WaitForChild("leaderstats", 5)
+	if leaderstats then
+		local level = leaderstats:WaitForChild("Level", 5)
+		local xp = leaderstats:WaitForChild("XP", 5)
+
+		if level then
+			level.Changed:Connect(function()
+				self:updateGUI()
+			end)
+		end
+
+		if xp then
+			xp.Changed:Connect(function()
+				self:updateGUI()
+			end)
+		end
+	end
+
+	self:updateGUI()
+end
+
+-- Limpar losangos principais (para troca de estilo)
+function GUIManager:clearMainDiamonds()
+	-- Remover apenas os losangos de ataque (não os laterais nem os de defesa)
+	for i = #self.diamonds, 1, -1 do
+		local diamond = self.diamonds[i]
+		-- Verificar se é losango principal (parent é staminaFrame E não é botão de defesa/dash)
+		if diamond.Frame.Parent == self.staminaFrame and 
+			diamond.Frame.Name ~= "Diamond_Defense" and 
+			diamond.Frame.Name ~= "Diamond_Dash" then
+			diamond.Frame:Destroy()
+			table.remove(self.diamonds, i)
+		end
+	end
+	print("Losangos principais limpos (defesa/dash preservados)")
+end
+
+-- NOVO: Obter referência aos botões de defesa
+function GUIManager:getDefenseButton()
+	return self.defenseButton
+end
+
+function GUIManager:getDashButton()
+	return self.dashButton
+end
+
+function GUIManager:cleanup()
+	if self.gui then
+		self.gui:Destroy()
+	end
+	self.diamonds = {}
+end
+
+return GUIManager
+-- MartialArtsConfig.lua
+-- Armazene em ReplicatedStorage.Modules.MartialArtsConfig
+
+local MartialArtsConfig = {}
+
+-- Definição das Artes Marciais/Estilos
+MartialArtsConfig.Styles = {
+	-- ESTILO BÁSICO (sem Tool equipada)
+	Basic = {
+		Name = "Combate Básico",
+		Description = "Golpes básicos de mão",
+		Attacks = {
+			{
+				type = "PunchL",
+				name = "Soco Esquerdo",
+				limb = "LeftHand",
+				threshold = 30,
+				color = Color3.fromRGB(100, 100, 100),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://95636977944297",
+				staminaCost = 10
+			},
+			{
+				type = "PunchR",
+				name = "Soco Direito",
+				limb = "RightHand",
+				threshold = 50,
+				color = Color3.fromRGB(100, 100, 100),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://138971230416634",
+				staminaCost = 10
+			},
+			{
+				type = "KickL",
+				name = "Chute",
+				limb = "LeftFoot",
+				threshold = 70,
+				color = Color3.fromRGB(100, 100, 100),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://100208056502677",
+				staminaCost = 15
+			},
+			{
+				type = "StrongPunch",
+				name = "Soco Forte",
+				limb = "RightHand",
+				threshold = 80,
+				color = Color3.fromRGB(100, 100, 100),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://115298741511748",
+				staminaCost = 20
+			}
+		}
+	},
+
+	-- KARATE (Tool: "Karate")
+	Karate = {
+		Name = "Karate",
+		Description = "Arte marcial japonesa focada em precisão",
+		ToolName = "Karate", -- Nome da Tool que ativa este estilo
+		Color = Color3.fromRGB(255, 200, 100), -- Cor temática
+		Attacks = {
+			{
+				type = "KarateChop",
+				name = "Golpe de Mão",
+				limb = "RightHand",
+				threshold = 25,
+				color = Color3.fromRGB(255, 200, 100),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://95636977944297",
+				staminaCost = 8
+			},
+			{
+				type = "FrontKick",
+				name = "Mae Geri",
+				limb = "RightFoot",
+				threshold = 40,
+				color = Color3.fromRGB(255, 200, 100),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://100208056502677",
+				staminaCost = 12
+			},
+			{
+				type = "RoundKick",
+				name = "Mawashi Geri",
+				limb = "RightFoot",
+				threshold = 60,
+				color = Color3.fromRGB(255, 200, 100),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://100208056502677",
+				staminaCost = 15
+			},
+			{
+				type = "ElbowStrike",
+				name = "Empi",
+				limb = "RightHand",
+				threshold = 75,
+				color = Color3.fromRGB(255, 200, 100),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://115298741511748",
+				staminaCost = 18
+			}
+		}
+	},
+
+	-- MUAY THAI (Tool: "MuayThai")
+	MuayThai = {
+		Name = "Muay Thai",
+		Description = "Arte das oito armas - socos, chutes, joelhos e cotovelos",
+		ToolName = "MuayThai",
+		Color = Color3.fromRGB(255, 50, 50),
+		Attacks = {
+			{
+				type = "Jab",
+				name = "Jab Rápido",
+				limb = "LeftHand",
+				threshold = 20,
+				color = Color3.fromRGB(255, 50, 50),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://95636977944297",
+				staminaCost = 7
+			},
+			{
+				type = "ThaiKick",
+				name = "Low Kick",
+				limb = "RightFoot",
+				threshold = 35,
+				color = Color3.fromRGB(255, 50, 50),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://100208056502677",
+				staminaCost = 10
+			},
+			{
+				type = "KneeStrike",
+				name = "Joelhada",
+				limb = "RightFoot",
+				threshold = 55,
+				color = Color3.fromRGB(255, 50, 50),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://100208056502677",
+				staminaCost = 13
+			},
+			{
+				type = "ElbowCombo",
+				name = "Combo de Cotovelo",
+				limb = "RightHand",
+				threshold = 70,
+				color = Color3.fromRGB(255, 50, 50),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://115298741511748",
+				staminaCost = 16
+			}
+		}
+	},
+
+	-- KUNG FU (Tool: "KungFu")
+	KungFu = {
+		Name = "Kung Fu",
+		Description = "Arte marcial chinesa com movimentos fluidos",
+		ToolName = "KungFu",
+		Color = Color3.fromRGB(255, 215, 0),
+		Attacks = {
+			{
+				type = "TigerClaw",
+				name = "Garra do Tigre",
+				limb = "RightHand",
+				threshold = 30,
+				color = Color3.fromRGB(255, 215, 0),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://95636977944297",
+				staminaCost = 10
+			},
+			{
+				type = "CraneKick",
+				name = "Chute do Grou",
+				limb = "RightFoot",
+				threshold = 45,
+				color = Color3.fromRGB(255, 215, 0),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://100208056502677",
+				staminaCost = 12
+			},
+			{
+				type = "DragonStrike",
+				name = "Golpe do Dragão",
+				limb = "RightHand",
+				threshold = 65,
+				color = Color3.fromRGB(255, 215, 0),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://138971230416634",
+				staminaCost = 15
+			},
+			{
+				type = "SnakeStyle",
+				name = "Estilo da Serpente",
+				limb = "RightHand",
+				threshold = 80,
+				color = Color3.fromRGB(255, 215, 0),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://115298741511748",
+				staminaCost = 20
+			}
+		}
+	},
+
+	-- TAEKWONDO (Tool: "Taekwondo")
+	Taekwondo = {
+		Name = "Taekwondo",
+		Description = "Arte coreana focada em chutes acrobáticos",
+		ToolName = "Taekwondo",
+		Color = Color3.fromRGB(100, 150, 255),
+		Attacks = {
+			{
+				type = "AxeKick",
+				name = "Chute Machado",
+				limb = "RightFoot",
+				threshold = 35,
+				color = Color3.fromRGB(100, 150, 255),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://100208056502677",
+				staminaCost = 11
+			},
+			{
+				type = "SpinKick",
+				name = "Chute Giratório",
+				limb = "LeftFoot",
+				threshold = 50,
+				color = Color3.fromRGB(100, 150, 255),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://100208056502677",
+				staminaCost = 14
+			},
+			{
+				type = "JumpKick",
+				name = "Chute Voador",
+				limb = "RightFoot",
+				threshold = 70,
+				color = Color3.fromRGB(100, 150, 255),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://100208056502677",
+				staminaCost = 17
+			},
+			{
+				type = "TornadoKick",
+				name = "Chute Tornado",
+				limb = "RightFoot",
+				threshold = 85,
+				color = Color3.fromRGB(100, 150, 255),
+				image = "rbxassetid://91491122820892",
+				animationId = "rbxassetid://100208056502677",
+				staminaCost = 22
+			}
+		}
+	}
+}
+
+-- Função helper para obter estilo por nome da Tool
+function MartialArtsConfig.GetStyleByToolName(toolName)
+	if not toolName then
+		return MartialArtsConfig.Styles.Basic
+	end
+
+	for styleName, styleData in pairs(MartialArtsConfig.Styles) do
+		if styleData.ToolName == toolName then
+			return styleData
+		end
+	end
+
+	return MartialArtsConfig.Styles.Basic
+end
+
+-- Função helper para obter todos os nomes de Tools
+function MartialArtsConfig.GetAllToolNames()
+	local toolNames = {}
+	for styleName, styleData in pairs(MartialArtsConfig.Styles) do
+		if styleData.ToolName then
+			table.insert(toolNames, styleData.ToolName)
+		end
+	end
+	return toolNames
+end
+
+return MartialArtsConfig
+-- MartialArtsController.lua
+-- Armazene em ReplicatedStorage.Modules.MartialArtsController
+
+local MartialArtsConfig = require(script.Parent.MartialArtsConfig)
+
+local MartialArtsController = {}
+MartialArtsController.__index = MartialArtsController
+
+function MartialArtsController.new(player, guiManager, combatController)
+	local self = setmetatable({}, MartialArtsController)
+
+	self.player = player
+	self.guiManager = guiManager
+	self.combatController = combatController
+
+	self.currentStyle = MartialArtsConfig.Styles.Basic
+	self.currentTool = nil
+
+	-- Conectar eventos
+	self:setupToolDetection()
+
+	print("MartialArtsController inicializado - Estilo: " .. self.currentStyle.Name)
+
+	return self
+end
+
+-- Detectar quando Tool é equipada/desequipada
+function MartialArtsController:setupToolDetection()
+	local character = self.player.Character or self.player.CharacterAdded:Wait()
+
+	-- Detectar Tool equipada
+	character.ChildAdded:Connect(function(child)
+		if child:IsA("Tool") then
+			self:onToolEquipped(child)
+		end
+	end)
+
+	-- Detectar Tool desequipada
+	character.ChildRemoved:Connect(function(child)
+		if child:IsA("Tool") then
+			self:onToolUnequipped(child)
+		end
+	end)
+
+	-- Verificar se já tem Tool equipada ao iniciar
+	for _, child in ipairs(character:GetChildren()) do
+		if child:IsA("Tool") then
+			self:onToolEquipped(child)
+			break
+		end
+	end
+end
+
+-- Quando Tool é equipada
+function MartialArtsController:onToolEquipped(tool)
+	print("🥋 Tool equipada: " .. tool.Name)
+
+	self.currentTool = tool
+	local newStyle = MartialArtsConfig.GetStyleByToolName(tool.Name)
+
+	if newStyle.Name ~= self.currentStyle.Name then
+		self:changeStyle(newStyle)
+	end
+end
+
+-- Quando Tool é desequipada
+function MartialArtsController:onToolUnequipped(tool)
+	print("🥋 Tool desequipada: " .. tool.Name)
+
+	self.currentTool = nil
+
+	-- Voltar para estilo básico
+	self:changeStyle(MartialArtsConfig.Styles.Basic)
+end
+
+-- Mudar estilo de combate
+function MartialArtsController:changeStyle(newStyle)
+	print("🥋 Mudando estilo: " .. self.currentStyle.Name .. " → " .. newStyle.Name)
+
+	self.currentStyle = newStyle
+
+	-- Atualizar losangos na GUI
+	self:updateDiamonds()
+
+	-- Notificar jogador
+	game:GetService("StarterGui"):SetCore("SendNotification", {
+		Title = "Estilo de Combate",
+		Text = newStyle.Name .. " equipado!",
+		Duration = 2
+	})
+end
+
+-- Atualizar losangos com novos golpes
+function MartialArtsController:updateDiamonds()
+	-- Limpar losangos atuais
+	self.guiManager:clearMainDiamonds()
+
+	-- Criar novos losangos com golpes do estilo atual
+	local diamondSize = 45 -- ConfigModule.GameplaySettings.DiamondSize
+	local padding = 5
+	local offset = (diamondSize / 1.414) + padding
+
+	local mainPositions = {
+		UDim2.new(0.5, 0, 0.5, -offset),  -- Cima
+		UDim2.new(0.5, 0, 0.5, offset),   -- Baixo
+		UDim2.new(0.5, offset, 0.5, 0),   -- Direita
+		UDim2.new(0.5, -offset, 0.5, 0)   -- Esquerda
+	}
+
+	for i, attack in ipairs(self.currentStyle.Attacks) do
+		if mainPositions[i] then
+			self.guiManager:createDiamond(
+				self.guiManager.staminaFrame,
+				mainPositions[i],
+				diamondSize,
+				attack.color,
+				attack.image,
+				attack.threshold,
+				attack.type,
+				attack.limb,
+				function(actionType, limb, threshold)
+					self.combatController:tryAttack(actionType, limb, threshold)
+				end
+			)
+		end
+	end
+
+	print("🥋 Losangos atualizados com " .. #self.currentStyle.Attacks .. " golpes de " .. self.currentStyle.Name)
+end
+
+-- Obter estilo atual
+function MartialArtsController:getCurrentStyle()
+	return self.currentStyle
+end
+
+-- Limpar
+function MartialArtsController:cleanup()
+	self.currentTool = nil
+	self.currentStyle = MartialArtsConfig.Styles.Basic
+	print("MartialArtsController limpo")
+end
+
+return MartialArtsController
+-- SoundManager.lua
+-- Armazene em ReplicatedStorage.Modules.SoundManager
+
+local SoundManager = {}
+SoundManager.__index = SoundManager
+
+function SoundManager.new(character, configModule)
+	local self = setmetatable({}, SoundManager)
+
+	self.character = character
+	self.config = configModule
+	self.sounds = {}
+
+	self:loadSounds()
+
+	return self
+end
+
+function SoundManager:loadSounds()
+	local soundIds = self.config.AssetIds.Sounds
+
+	for name, id in pairs(soundIds) do
+		local sound = Instance.new("Sound")
+		sound.SoundId = id
+		sound.Parent = self.character
+		sound.Loaded:Wait()
+
+		self.sounds[name] = sound
+		print("Som " .. name .. " carregado")
+	end
+end
+
+function SoundManager:playSound(soundName)
+	local sound = self.sounds[soundName]
+	if sound then
+		sound:Play()
+		return true
+	else
+		warn("Som não encontrado: " .. tostring(soundName))
+		return false
+	end
+end
+
+function SoundManager:stopSound(soundName)
+	local sound = self.sounds[soundName]
+	if sound then
+		sound:Stop()
+		return true
+	end
+	return false
+end
+
+function SoundManager:updateParent(newCharacter)
+	self.character = newCharacter
+	for _, sound in pairs(self.sounds) do
+		sound.Parent = newCharacter
+		sound.Loaded:Wait()
+	end
+end
+
+function SoundManager:cleanup()
+	for _, sound in pairs(self.sounds) do
+		sound:Stop()
+		sound:Destroy()
+	end
+	self.sounds = {}
+end
+
+return SoundManager
+-- SprintController.lua
+-- Armazene em ReplicatedStorage.Modules.SprintController
+
+local SprintController = {}
+SprintController.__index = SprintController
+
+function SprintController.new(humanoid, animationManager, soundManager, sprintEvent)
+	local self = setmetatable({}, SprintController)
+
+	self.humanoid = humanoid
+	self.animationManager = animationManager
+	self.soundManager = soundManager
+	self.sprintEvent = sprintEvent
+
+	self.isSprinting = false
+
+	self:setupMovementListener()
+
+	return self
+end
+
+function SprintController:isCharacterMoving()
+	return self.humanoid.MoveDirection.Magnitude > 0
+end
+
+function SprintController:tryRun()
+	if self.humanoid.Health <= 0 then
+		print("Jogador morto, corrida cancelada")
+		return false
+	end
+
+	local staminaValue = self.humanoid:FindFirstChild("Stamina")
+	if not staminaValue then
+		warn("Stamina não encontrada!")
+		return false
+	end
+
+	if self.isSprinting then
+		-- Desativar corrida
+		self:stopRun()
+		return true
+	else
+		-- Tentar ativar corrida
+		if staminaValue.Value < 20 then
+			return false
+		end
+
+		self.isSprinting = true
+		self.sprintEvent:FireServer(true)
+
+		if self:isCharacterMoving() then
+			self.animationManager:playTrack("Run")
+			self.soundManager:playSound("Run")
+		end
+
+		print("Corrida ativada")
+		return true
+	end
+end
+
+function SprintController:stopRun()
+	if not self.isSprinting then
+		return
+	end
+
+	self.isSprinting = false
+	self.animationManager:stopTrack("Run")
+	self.soundManager:stopSound("Run")
+	self.sprintEvent:FireServer(false)
+
+	print("Corrida parada")
+end
+
+function SprintController:setupMovementListener()
+	self.humanoid:GetPropertyChangedSignal("MoveDirection"):Connect(function()
+		if self.isSprinting then
+			if self:isCharacterMoving() then
+				-- Está se movendo durante sprint
+				if not self.animationManager:isPlaying("Run") then
+					self.animationManager:playTrack("Run")
+					self.soundManager:playSound("Run")
+				end
+			else
+				-- Parou de se mover - desativar sprint
+				print("Parou de se mover - desativando sprint")
+				self:stopRun()
+			end
+		end
+	end)
+end
+
+function SprintController:checkStamina(currentStamina)
+	if self.isSprinting and currentStamina < 20 then
+		self:stopRun()
+	end
+end
+
+function SprintController:reset()
+	self:stopRun()
+	self.isSprinting = false
+end
+
+return SprintController
+-- CombatHandler.lua
+-- Armazene em ServerScriptService.Modules.CombatHandler
+
+local ServerConfig = require(script.Parent.ServerConfig)
+local PlayerDataManager = require(script.Parent.PlayerDataManager)
+
+local CombatHandler = {}
+
+-- Tabela de cooldowns por jogador
+local playerCooldowns = {}
+
+-- Validar ataque do jogador
+function CombatHandler.ValidateAttack(player, attackType)
+	-- Verificar cooldown
+	local currentTime = tick()
+	local lastAttack = playerCooldowns[player.UserId]
+
+	if lastAttack and currentTime - lastAttack < ServerConfig.Combat.Cooldown then
+		return false, "Cooldown ativo"
+	end
+
+	-- Verificar se o personagem existe
+	local character = player.Character
+	if not character then
+		return false, "Personagem não encontrado"
+	end
+
+	-- Verificar se está vivo
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return false, "Você está morto"
+	end
+
+	-- Verificar stamina
+	local staminaCost = ServerConfig.Combat.StaminaCosts[attackType] or 10
+	local staminaValue = humanoid:FindFirstChild("Stamina")
+
+	if not staminaValue or staminaValue.Value < staminaCost then
+		return false, "Stamina insuficiente (" .. staminaCost .. " necessário)"
+	end
+
+	return true, staminaCost
+end
+
+-- Processar ataque
+function CombatHandler.ProcessAttack(player, attackType, limb)
+	-- Validar ataque
+	local isValid, staminaCostOrError = CombatHandler.ValidateAttack(player, attackType)
+
+	if not isValid then
+		return false, staminaCostOrError
+	end
+
+	local staminaCost = staminaCostOrError
+	local character = player.Character
+	local humanoid = character:FindFirstChild("Humanoid")
+
+	-- Consumir stamina
+	local staminaValue = humanoid:FindFirstChild("Stamina")
+	staminaValue.Value = math.max(staminaValue.Value - staminaCost, 0)
+
+	-- Atualizar cooldown
+	playerCooldowns[player.UserId] = tick()
+
+	-- Encontrar o membro para criar hitbox
+	local limbPart = character:FindFirstChild(limb)
+	if not limbPart then
+		warn("Membro não encontrado: " .. tostring(limb))
+		return false, "Membro inválido"
+	end
+
+	-- Criar hitbox temporária
+	CombatHandler.CreateHitbox(player, limbPart, humanoid)
+
+	return true, "Ataque executado"
+end
+
+-- Criar hitbox temporária para detectar acertos
+function CombatHandler.CreateHitbox(player, limbPart, humanoid)
+	local hitTargets = {} -- Evitar múltiplos hits no mesmo alvo
+	local hitboxActive = true
+
+	local connection
+	connection = limbPart.Touched:Connect(function(hit)
+		if not hitboxActive then return end
+
+		-- Verificar se atingiu um humanoid válido
+		local targetHumanoid = hit.Parent:FindFirstChild("Humanoid")
+
+		-- Validações
+		if not targetHumanoid then return end
+		if targetHumanoid == humanoid then return end -- Não acertar a si mesmo
+		if targetHumanoid.Health <= 0 then return end -- Não acertar mortos
+		if hitTargets[targetHumanoid] then return end -- Já acertou este alvo
+
+		-- Marcar como atingido
+		hitTargets[targetHumanoid] = true
+
+		-- Calcular e aplicar dano
+		local damage = math.random(ServerConfig.Combat.MinDamage, ServerConfig.Combat.MaxDamage)
+		targetHumanoid:TakeDamage(damage)
+
+		print(player.Name .. " causou " .. damage .. " de dano em " .. targetHumanoid.Parent.Name)
+
+		-- Adicionar XP ao atacante
+		local playerData = PlayerDataManager.GetPlayerData(player)
+		if playerData then
+			playerData:AddXP(ServerConfig.Combat.XPPerHit)
+		end
+
+		-- NOVO: Enviar informação de combo para o cliente
+		local ComboEvent = game.ReplicatedStorage:FindFirstChild("ComboEvent")
+		if ComboEvent then
+			-- Envia: alvo atingido e dano causado
+			ComboEvent:FireClient(player, targetHumanoid.Parent.Name, damage)
+		end
+	end)
+
+	-- Desativar hitbox após duração
+	task.delay(ServerConfig.Combat.HitboxDuration, function()
+		hitboxActive = false
+		if connection then
+			connection:Disconnect()
+		end
+	end)
+end
+
+-- Limpar cooldown ao remover jogador
+function CombatHandler.CleanupPlayer(player)
+	playerCooldowns[player.UserId] = nil
+end
+
+return CombatHandler
+-- DefenseHandler.lua
+-- Armazene em ServerScriptService.Modules.DefenseHandler
+
+local DefenseHandler = {}
+
+-- Tabelas de estado dos jogadores
+local playerStates = {} -- Estado atual de defesa
+local dashIFrames = {} -- I-Frames de dash
+local parryWindows = {} -- Janelas de parry ativas
+local stunnedPlayers = {} -- Jogadores atordoados
+
+-- Direções de dash (servidor precisa saber)
+local dashDirections = {
+	W = Vector3.new(0, 0, -1),
+	A = Vector3.new(-1, 0, 0),
+	S = Vector3.new(0, 0, 1),
+	D = Vector3.new(1, 0, 0)
+}
+
+-- Processar ação de defesa
+function DefenseHandler.ProcessDefense(player, action, data, config)
+	local userId = player.UserId
+
+	if action == "Dash" then
+		return DefenseHandler.ProcessDash(player, data, config)
+
+	elseif action == "BlockStart" then
+		return DefenseHandler.StartBlock(player, config)
+
+	elseif action == "BlockEnd" then
+		return DefenseHandler.EndBlock(player)
+
+	elseif action == "Parry" then
+		return DefenseHandler.StartParry(player, config)
+	end
+
+	return false, "Ação inválida"
+end
+
+-- Processar Dash
+function DefenseHandler.ProcessDash(player, direction, config)
+	local character = player.Character
+	if not character then
+		return false, "Personagem não encontrado"
+	end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return false, "Personagem morto"
+	end
+
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	if not rootPart then
+		return false, "HumanoidRootPart não encontrado"
+	end
+
+	-- Verificar stamina
+	local staminaValue = humanoid:FindFirstChild("Stamina")
+	if not staminaValue or staminaValue.Value < config.Dash.StaminaCost then
+		return false, "Stamina insuficiente"
+	end
+
+	-- Consumir stamina
+	staminaValue.Value = math.max(staminaValue.Value - config.Dash.StaminaCost, 0)
+
+	-- Aplicar movimento
+	humanoid.AutoRotate = false
+
+	local linearVelocity = Instance.new("LinearVelocity")
+	linearVelocity.MaxForce = 10000
+	linearVelocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+	linearVelocity.VectorVelocity = dashDirections[direction] * config.Dash.Speed
+	linearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+
+	local attachment = rootPart:FindFirstChild("RootAttachment")
+	if not attachment then
+		attachment = Instance.new("Attachment")
+		attachment.Parent = rootPart
+	end
+
+	linearVelocity.Attachment0 = attachment
+	linearVelocity.Parent = rootPart
+
+	-- Destruir após duração
+	game:GetService("Debris"):AddItem(linearVelocity, config.Dash.Duration)
+
+	-- Restaurar AutoRotate
+	task.delay(config.Dash.Duration, function()
+		if humanoid then
+			humanoid.AutoRotate = true
+		end
+	end)
+
+	-- Ativar I-Frames
+	dashIFrames[player.UserId] = tick()
+	playerStates[player.UserId] = "Dashing"
+
+	print(player.Name .. " executou dash " .. direction)
+
+	-- Remover I-Frames após duração
+	task.delay(config.Dash.IFramesDuration, function()
+		dashIFrames[player.UserId] = nil
+		if playerStates[player.UserId] == "Dashing" then
+			playerStates[player.UserId] = nil
+		end
+	end)
+
+	return true, "Dash executado"
+end
+
+-- Iniciar Block
+function DefenseHandler.StartBlock(player, config)
+	local character = player.Character
+	if not character then return false, "Personagem não encontrado" end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then return false, "Personagem morto" end
+
+	-- Marcar como bloqueando
+	playerStates[player.UserId] = "Blocking"
+
+	-- Reduzir velocidade de movimento
+	humanoid.WalkSpeed = 16 * config.Block.MovementSpeedMultiplier
+
+	print(player.Name .. " começou a bloquear")
+
+	return true, "Block ativado"
+end
+
+-- Terminar Block
+function DefenseHandler.EndBlock(player)
+	local character = player.Character
+	if not character then return false, "Personagem não encontrado" end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid then return false, "Humanoid não encontrado" end
+
+	-- Remover estado
+	playerStates[player.UserId] = nil
+
+	-- Restaurar velocidade
+	humanoid.WalkSpeed = 16
+
+	print(player.Name .. " parou de bloquear")
+
+	return true, "Block desativado"
+end
+
+-- Iniciar Parry
+function DefenseHandler.StartParry(player, config)
+	local character = player.Character
+	if not character then return false, "Personagem não encontrado" end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then return false, "Personagem morto" end
+
+	-- Verificar stamina
+	local staminaValue = humanoid:FindFirstChild("Stamina")
+	if not staminaValue or staminaValue.Value < config.Parry.StaminaCost then
+		return false, "Stamina insuficiente"
+	end
+
+	-- Consumir stamina
+	staminaValue.Value = math.max(staminaValue.Value - config.Parry.StaminaCost, 0)
+
+	-- Ativar janela de parry
+	parryWindows[player.UserId] = {
+		startTime = tick(),
+		duration = config.Parry.WindowDuration
+	}
+	playerStates[player.UserId] = "ParryWindow"
+
+	print(player.Name .. " ativou parry - janela de " .. config.Parry.WindowDuration .. "s")
+
+	-- Remover janela após duração
+	task.delay(config.Parry.WindowDuration, function()
+		if parryWindows[player.UserId] then
+			parryWindows[player.UserId] = nil
+			if playerStates[player.UserId] == "ParryWindow" then
+				playerStates[player.UserId] = nil
+			end
+			print(player.Name .. " - janela de parry expirou")
+		end
+	end)
+
+	return true, "Parry ativado"
+end
+
+-- Calcular redução de dano
+function DefenseHandler.CalculateDamageReduction(defender, attacker, baseDamage, config)
+	local defenderUserId = defender.UserId
+	local state = playerStates[defenderUserId]
+
+	-- Verificar I-Frames do Dash
+	if dashIFrames[defenderUserId] then
+		print(defender.Name .. " esquivou com dash (I-Frames)")
+		return 0, "Dash" -- Dano zero (esquivou)
+	end
+
+	-- Verificar Parry Window
+	if parryWindows[defenderUserId] then
+		-- PARRY BEM SUCEDIDO!
+		print(defender.Name .. " executou PARRY em " .. attacker.Name)
+
+		-- Remover janela
+		parryWindows[defenderUserId] = nil
+		playerStates[defenderUserId] = "ParrySuccess"
+
+		-- Atordoar atacante
+		DefenseHandler.StunPlayer(attacker, config)
+
+		-- Recuperar stamina do defensor
+		local defenderChar = defender.Character
+		if defenderChar then
+			local humanoid = defenderChar:FindFirstChild("Humanoid")
+			if humanoid then
+				local staminaValue = humanoid:FindFirstChild("Stamina")
+				if staminaValue then
+					staminaValue.Value = math.min(
+						staminaValue.Value + config.Parry.StaminaRecovery,
+						100 -- Máximo
+					)
+				end
+			end
+		end
+
+		return 0, "Parry" -- Dano zero + contra-ataque
+	end
+
+	-- Verificar Block
+	if state == "Blocking" then
+		local defenderChar = defender.Character
+		if defenderChar then
+			local humanoid = defenderChar:FindFirstChild("Humanoid")
+			if humanoid then
+				-- Consumir stamina ao bloquear
+				local staminaValue = humanoid:FindFirstChild("Stamina")
+				if staminaValue then
+					staminaValue.Value = math.max(
+						staminaValue.Value - config.Block.StaminaDrainPerHit,
+						0
+					)
+
+					-- Se stamina acabar, quebra o block
+					if staminaValue.Value == 0 then
+						DefenseHandler.EndBlock(defender)
+						print(defender.Name .. " - block quebrado (sem stamina)")
+						return baseDamage, "BlockBroken" -- Dano total
+					end
+				end
+			end
+		end
+
+		local reducedDamage = baseDamage * config.DamageReduction.Block
+		print(defender.Name .. " bloqueou - dano reduzido de " .. baseDamage .. " para " .. reducedDamage)
+		return reducedDamage, "Block"
+	end
+
+	-- Sem defesa
+	return baseDamage, "None"
+end
+
+-- Atordoar jogador (após parry bem sucedido)
+function DefenseHandler.StunPlayer(player, config)
+	local character = player.Character
+	if not character then return end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid then return end
+
+	-- Marcar como atordoado
+	stunnedPlayers[player.UserId] = {
+		startTime = tick(),
+		duration = config.Parry.StunDuration
+	}
+	playerStates[player.UserId] = "Stunned"
+
+	-- Impedir movimento (opcional)
+	humanoid.WalkSpeed = 0
+
+	print(player.Name .. " ATORDOADO por " .. config.Parry.StunDuration .. "s")
+
+	-- Remover atordoamento após duração
+	task.delay(config.Parry.StunDuration, function()
+		stunnedPlayers[player.UserId] = nil
+		if playerStates[player.UserId] == "Stunned" then
+			playerStates[player.UserId] = nil
+		end
+
+		if humanoid then
+			humanoid.WalkSpeed = 16 -- Restaurar velocidade
+		end
+
+		print(player.Name .. " recuperou do atordoamento")
+	end)
+end
+
+-- Verificar se jogador está atordoado
+function DefenseHandler.IsStunned(player)
+	return stunnedPlayers[player.UserId] ~= nil
+end
+
+-- Obter estado de defesa do jogador
+function DefenseHandler.GetPlayerState(player)
+	return playerStates[player.UserId] or "None"
+end
+
+-- Limpar dados do jogador
+function DefenseHandler.CleanupPlayer(player)
+	playerStates[player.UserId] = nil
+	dashIFrames[player.UserId] = nil
+	parryWindows[player.UserId] = nil
+	stunnedPlayers[player.UserId] = nil
+end
+
+return DefenseHandler
+-- FireballConfig.lua
+-- Armazene em ServerScriptService.Modules.FireballConfig
+
+local FireballConfig = {}
+
+-- Configurações da Fireball
+FireballConfig.Fireball = {
+	-- Dano
+	MinDamage = 30,
+	MaxDamage = 50,
+
+	-- Física
+	Speed = 100,
+	Lifetime = 1.5, -- Segundos antes de destruir
+
+	-- Custos
+	ManaCost = 20,
+	Cooldown = 1.5, -- Segundos entre lançamentos
+
+	-- Visual
+	FireballSize = Vector3.new(2, 2, 2),
+	FireballColor = Color3.fromRGB(255, 100, 0),
+	TrailEnabled = true,
+
+	-- Sons
+	ThrowSoundId = "rbxassetid://116304548955191", -- YOUR_THROW_SOUND
+	HitSoundId = "rbxassetid://116304548955191", -- YOUR_HIT_SOUND
+	CatchSoundId = "rbxassetid://116304548955191", -- YOUR_CATCH_SOUND
+
+	-- Animação
+	AnimationId = "rbxassetid://2515090838",
+
+	-- Tecla de ativação
+	ActivationKey = Enum.KeyCode.F,
+
+	-- XP ao acertar
+	XPReward = 15
+}
+
+return FireballConfig
+-- FireballHandler.lua
+-- Armazene em ServerScriptService.Modules.FireballHandler
+
+local FireballConfig = require(script.Parent.FireballConfig)
+local PlayerDataManager = require(script.Parent.PlayerDataManager)
+
+local FireballHandler = {}
+
+-- Tabela de cooldowns por jogador
+local playerCooldowns = {}
+
+-- Validar lançamento de fireball
+function FireballHandler.ValidateFireball(player)
+	-- Verificar cooldown
+	local currentTime = tick()
+	local lastCast = playerCooldowns[player.UserId]
+
+	if lastCast and currentTime - lastCast < FireballConfig.Fireball.Cooldown then
+		return false, "Cooldown ativo"
+	end
+
+	-- Verificar se o personagem existe
+	local character = player.Character
+	if not character then
+		return false, "Personagem não encontrado"
+	end
+
+	-- Verificar se está vivo
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return false, "Você está morto"
+	end
+
+	-- Verificar mana
+	local manaValue = humanoid:FindFirstChild("Mana")
+	if not manaValue or manaValue.Value < FireballConfig.Fireball.ManaCost then
+		return false, "Mana insuficiente (" .. FireballConfig.Fireball.ManaCost .. " necessário)"
+	end
+
+	return true, nil
+end
+
+-- Processar lançamento de fireball
+function FireballHandler.ProcessFireball(player, mousePosition)
+	-- Validar
+	local isValid, errorMessage = FireballHandler.ValidateFireball(player)
+
+	if not isValid then
+		return false, errorMessage
+	end
+
+	local character = player.Character
+	local humanoid = character:FindFirstChild("Humanoid")
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+
+	if not rootPart then
+		return false, "HumanoidRootPart não encontrado"
+	end
+
+	-- Consumir mana
+	local manaValue = humanoid:FindFirstChild("Mana")
+	manaValue.Value = math.max(manaValue.Value - FireballConfig.Fireball.ManaCost, 0)
+
+	-- Atualizar cooldown
+	playerCooldowns[player.UserId] = tick()
+
+	-- Criar fireball
+	FireballHandler.CreateFireball(player, rootPart, mousePosition)
+
+	return true, "Fireball lançada"
+end
+
+-- Criar e lançar fireball
+function FireballHandler.CreateFireball(player, rootPart, targetPosition)
+	-- Criar a fireball
+	local fireball = Instance.new("Part")
+	fireball.Name = "Fireball"
+	fireball.Size = FireballConfig.Fireball.FireballSize
+	fireball.Shape = Enum.PartType.Ball
+	fireball.Material = Enum.Material.Neon
+	fireball.Color = FireballConfig.Fireball.FireballColor
+	fireball.CFrame = rootPart.CFrame + rootPart.CFrame.LookVector * 3
+	fireball.CanCollide = false
+	fireball.Anchored = false
+
+	-- Adicionar luz de fogo
+	local light = Instance.new("PointLight")
+	light.Color = FireballConfig.Fireball.FireballColor
+	light.Brightness = 2
+	light.Range = 15
+	light.Parent = fireball
+
+	-- Adicionar trail (opcional)
+	if FireballConfig.Fireball.TrailEnabled then
+		local attachment0 = Instance.new("Attachment")
+		attachment0.Parent = fireball
+
+		local attachment1 = Instance.new("Attachment")
+		attachment1.Parent = fireball
+		attachment1.Position = Vector3.new(0, 0, -1)
+
+		local trail = Instance.new("Trail")
+		trail.Attachment0 = attachment0
+		trail.Attachment1 = attachment1
+		trail.Color = ColorSequence.new(FireballConfig.Fireball.FireballColor)
+		trail.Lifetime = 0.5
+		trail.MinLength = 0
+		trail.Parent = fireball
+	end
+
+	-- Adicionar efeito de partículas
+	local particleEmitter = Instance.new("ParticleEmitter")
+	particleEmitter.Color = ColorSequence.new(FireballConfig.Fireball.FireballColor)
+	particleEmitter.Size = NumberSequence.new(1, 0)
+	particleEmitter.Texture = "rbxasset://textures/particles/fire_main.dds"
+	particleEmitter.Rate = 50
+	particleEmitter.Lifetime = NumberRange.new(0.3, 0.5)
+	particleEmitter.Speed = NumberRange.new(2, 5)
+	particleEmitter.Parent = fireball
+
+	-- Adicionar BodyVelocity
+	local bodyVelocity = Instance.new("BodyVelocity")
+	bodyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+
+	-- Calcular direção
+	local direction = (targetPosition - rootPart.Position).Unit
+	bodyVelocity.Velocity = direction * FireballConfig.Fireball.Speed
+	bodyVelocity.Parent = fireball
+
+	-- Parentar ao workspace
+	fireball.Parent = game.Workspace
+
+	-- Tocar som de lançamento
+	local throwSound = Instance.new("Sound")
+	throwSound.SoundId = FireballConfig.Fireball.ThrowSoundId
+	throwSound.Parent = fireball
+	throwSound:Play()
+
+	-- Configurar colisão
+	local hitTargets = {}
+
+	local connection
+	connection = fireball.Touched:Connect(function(hit)
+		-- Ignorar o próprio jogador
+		if hit:IsDescendantOf(player.Character) then
+			return
+		end
+
+		-- Verificar se atingiu humanoid
+		local targetHumanoid = hit.Parent:FindFirstChild("Humanoid")
+
+		if targetHumanoid and not hitTargets[targetHumanoid] then
+			hitTargets[targetHumanoid] = true
+
+			-- Calcular e aplicar dano
+			local damage = math.random(
+				FireballConfig.Fireball.MinDamage,
+				FireballConfig.Fireball.MaxDamage
+			)
+
+			targetHumanoid:TakeDamage(damage)
+
+			print(player.Name .. " acertou fireball em " .. hit.Parent.Name .. " (" .. damage .. " dano)")
+
+			-- Adicionar XP
+			local playerData = PlayerDataManager.GetPlayerData(player)
+			if playerData then
+				playerData:AddXP(FireballConfig.Fireball.XPReward)
+			end
+
+			-- Enviar evento de combo
+			local ComboEvent = game.ReplicatedStorage:FindFirstChild("ComboEvent")
+			if ComboEvent then
+				ComboEvent:FireClient(player, hit.Parent.Name, damage)
+			end
+
+			-- Tocar som de impacto
+			local hitSound = Instance.new("Sound")
+			hitSound.SoundId = FireballConfig.Fireball.HitSoundId
+			hitSound.Parent = fireball
+			hitSound:Play()
+
+			-- Destruir fireball após impacto
+			game:GetService("Debris"):AddItem(fireball, 0.5)
+			connection:Disconnect()
+
+		elseif not targetHumanoid and hit.CanCollide then
+			-- Atingiu parede/obstáculo
+			print("Fireball atingiu " .. hit.Name)
+			game:GetService("Debris"):AddItem(fireball, 0.1)
+			connection:Disconnect()
+		end
+	end)
+
+	-- Destruir após tempo de vida
+	game:GetService("Debris"):AddItem(fireball, FireballConfig.Fireball.Lifetime)
+end
+
+-- Limpar cooldown ao remover jogador
+function FireballHandler.CleanupPlayer(player)
+	playerCooldowns[player.UserId] = nil
+end
+
+return FireballHandler
+-- PlayerDataManager.lua
+-- Armazene em ServerScriptService.Modules.PlayerDataManager
+
+local DataStoreService = game:GetService("DataStoreService")
+local ServerConfig = require(script.Parent.ServerConfig)
+
+local PlayerDataStore = DataStoreService:GetDataStore(ServerConfig.DataStore.Name)
+
+local PlayerDataManager = {}
+PlayerDataManager.__index = PlayerDataManager
+
+-- Cache de dados dos jogadores
+local playerDataCache = {}
+
+function PlayerDataManager.new(player)
+	local self = setmetatable({}, PlayerDataManager)
+
+	self.player = player
+	self.userId = player.UserId
+	self.leaderstats = nil
+	self.levelValue = nil
+	self.xpValue = nil
+
+	return self
+end
+
+-- Carregar dados do jogador do DataStore
+function PlayerDataManager:LoadData()
+	local key = "Player_" .. self.userId
+	local attempts = 0
+	local maxAttempts = ServerConfig.DataStore.RetryAttempts
+
+	while attempts < maxAttempts do
+		local success, result = pcall(function()
+			return PlayerDataStore:GetAsync(key)
+		end)
+
+		if success then
+			if result then
+				print("Dados carregados para " .. self.player.Name)
+				return result
+			else
+				-- Novo jogador, retornar dados padrão
+				print("Novo jogador detectado: " .. self.player.Name)
+				return {Level = 1, XP = 0}
+			end
+		else
+			attempts = attempts + 1
+			warn("Tentativa " .. attempts .. " falhou ao carregar dados para " .. self.player.Name .. ": " .. tostring(result))
+
+			if attempts < maxAttempts then
+				task.wait(ServerConfig.DataStore.RetryDelay)
+			end
+		end
+	end
+
+	-- Se todas as tentativas falharem, retornar dados padrão
+	warn("Falha ao carregar dados após " .. maxAttempts .. " tentativas. Usando dados padrão.")
+	return {Level = 1, XP = 0}
+end
+
+-- Salvar dados do jogador no DataStore
+function PlayerDataManager:SaveData()
+	if not self.levelValue or not self.xpValue then
+		warn("Tentativa de salvar dados sem valores inicializados")
+		return false
+	end
+
+	local key = "Player_" .. self.userId
+	local dataToSave = {
+		Level = self.levelValue.Value,
+		XP = self.xpValue.Value
+	}
+
+	local attempts = 0
+	local maxAttempts = ServerConfig.DataStore.RetryAttempts
+
+	while attempts < maxAttempts do
+		local success, errorMessage = pcall(function()
+			PlayerDataStore:SetAsync(key, dataToSave)
+		end)
+
+		if success then
+			print("Dados salvos para " .. self.player.Name)
+			return true
+		else
+			attempts = attempts + 1
+			warn("Tentativa " .. attempts .. " falhou ao salvar dados para " .. self.player.Name .. ": " .. tostring(errorMessage))
+
+			if attempts < maxAttempts then
+				task.wait(ServerConfig.DataStore.RetryDelay)
+			end
+		end
+	end
+
+	warn("Falha ao salvar dados após " .. maxAttempts .. " tentativas")
+	return false
+end
+
+-- Inicializar leaderstats do jogador
+function PlayerDataManager:InitializeLeaderstats()
+	-- Carregar dados salvos
+	local savedData = self:LoadData()
+
+	-- Criar pasta leaderstats
+	self.leaderstats = Instance.new("Folder")
+	self.leaderstats.Name = "leaderstats"
+	self.leaderstats.Parent = self.player
+
+	-- Criar Level
+	self.levelValue = Instance.new("IntValue")
+	self.levelValue.Name = "Level"
+	self.levelValue.Value = savedData.Level
+	self.levelValue.Parent = self.leaderstats
+
+	-- Criar XP
+	self.xpValue = Instance.new("IntValue")
+	self.xpValue.Name = "XP"
+	self.xpValue.Value = savedData.XP
+	self.xpValue.Parent = self.leaderstats
+
+	-- Conectar auto-save quando valores mudarem
+	self.levelValue.Changed:Connect(function()
+		self:SaveData()
+	end)
+
+	self.xpValue.Changed:Connect(function()
+		self:SaveData()
+		self:CheckLevelUp()
+	end)
+
+	-- Salvar ao sair
+	self.player.AncestryChanged:Connect(function()
+		if not self.player.Parent then
+			self:SaveData()
+		end
+	end)
+
+	print("Leaderstats inicializados para " .. self.player.Name)
+end
+
+-- Verificar e processar level up
+function PlayerDataManager:CheckLevelUp()
+	if not self.levelValue or not self.xpValue then
+		return false
+	end
+
+	local xpNeeded = ServerConfig.Leveling.XPFormula(self.levelValue.Value)
+
+	if self.xpValue.Value >= xpNeeded then
+		self.xpValue.Value = self.xpValue.Value - xpNeeded
+		self.levelValue.Value = self.levelValue.Value + 1
+
+		print(self.player.Name .. " subiu para o nível " .. self.levelValue.Value)
+		return true
+	end
+
+	return false
+end
+
+-- Adicionar XP ao jogador
+function PlayerDataManager:AddXP(amount)
+	if self.xpValue then
+		self.xpValue.Value = self.xpValue.Value + amount
+		return true
+	end
+	return false
+end
+
+-- Obter nível do jogador
+function PlayerDataManager:GetLevel()
+	return self.levelValue and self.levelValue.Value or 1
+end
+
+-- Limpar dados ao remover jogador
+function PlayerDataManager:Cleanup()
+	self:SaveData()
+	playerDataCache[self.userId] = nil
+end
+
+-- Funções estáticas para gerenciar cache global
+
+function PlayerDataManager.GetPlayerData(player)
+	return playerDataCache[player.UserId]
+end
+
+function PlayerDataManager.CreatePlayerData(player)
+	local data = PlayerDataManager.new(player)
+	data:InitializeLeaderstats()
+	playerDataCache[player.UserId] = data
+	return data
+end
+
+function PlayerDataManager.RemovePlayerData(player)
+	local data = playerDataCache[player.UserId]
+	if data then
+		data:Cleanup()
+	end
+end
+
+return PlayerDataManager
+-- PlayerStatsManager.lua
+-- Armazene em ServerScriptService.Modules.PlayerStatsManager
+
+local ServerConfig = require(script.Parent.ServerConfig)
+local PlayerDataManager = require(script.Parent.PlayerDataManager)
+
+local PlayerStatsManager = {}
+PlayerStatsManager.__index = PlayerStatsManager
+
+-- Tabela para rastrear jogadores correndo
+local sprintingPlayers = {}
+
+function PlayerStatsManager.new(player, character)
+	local self = setmetatable({}, PlayerStatsManager)
+
+	self.player = player
+	self.character = character
+	self.humanoid = character:WaitForChild("Humanoid")
+	self.playerData = PlayerDataManager.GetPlayerData(player)
+
+	self:initializeStats()
+	self:startRegeneration()
+
+	return self
+end
+
+-- Inicializar atributos do personagem
+function PlayerStatsManager:initializeStats()
+	local level = self.playerData:GetLevel()
+	local config = ServerConfig.PlayerStats
+
+	-- Configurar movimento
+	local rootPart = self.character:WaitForChild("HumanoidRootPart")
+	rootPart.Anchored = false
+	self.humanoid.PlatformStand = false
+
+	-- NOVO: Desabilitar consumo de stamina do pulo padrão do Roblox
+	self.humanoid.UseJumpPower = true  -- Usar JumpPower em vez de JumpHeight
+	-- Nota: Isso previne o consumo automático de stamina pelo Roblox
+
+	-- Configurar vida
+	self.humanoid.MaxHealth = config.BaseHealth + (level * config.HealthPerLevel)
+	self.humanoid.Health = self.humanoid.MaxHealth
+
+	-- Criar Stamina
+	self.staminaValue = Instance.new("NumberValue")
+	self.staminaValue.Name = "Stamina"
+	self.staminaValue.Value = config.BaseStamina + (level * config.StaminaPerLevel)
+	self.staminaValue.Parent = self.humanoid
+
+	-- Criar Mana
+	self.manaValue = Instance.new("NumberValue")
+	self.manaValue.Name = "Mana"
+	self.manaValue.Value = config.BaseMana + (level * config.ManaPerLevel)
+	self.manaValue.Parent = self.humanoid
+
+	-- Conectar mudança de nível para atualizar stats
+	self.playerData.levelValue.Changed:Connect(function()
+		self:updateStatsOnLevelUp()
+	end)
+
+	print("Stats inicializados para " .. self.player.Name)
+end
+
+-- Atualizar stats quando subir de nível
+function PlayerStatsManager:updateStatsOnLevelUp()
+	local level = self.playerData:GetLevel()
+	local config = ServerConfig.PlayerStats
+
+	-- Atualizar vida máxima
+	local oldMaxHealth = self.humanoid.MaxHealth
+	self.humanoid.MaxHealth = config.BaseHealth + (level * config.HealthPerLevel)
+
+	-- Curar proporcionalmente
+	local healthPercent = self.humanoid.Health / oldMaxHealth
+	self.humanoid.Health = self.humanoid.MaxHealth * healthPercent
+
+	-- Atualizar e restaurar stamina e mana
+	local maxStamina = config.BaseStamina + (level * config.StaminaPerLevel)
+	local maxMana = config.BaseMana + (level * config.ManaPerLevel)
+
+	self.staminaValue.Value = maxStamina
+	self.manaValue.Value = maxMana
+
+	print(self.player.Name .. " teve seus atributos atualizados (Nível " .. level .. ")")
+end
+
+-- Iniciar regeneração de stamina e mana
+function PlayerStatsManager:startRegeneration()
+	self.regenTask = task.spawn(function()
+		local config = ServerConfig.PlayerStats
+
+		while self.character and self.character.Parent do
+			task.wait(config.RegenInterval)
+
+			if not self.humanoid or self.humanoid.Health <= 0 then
+				continue
+			end
+
+			local level = self.playerData:GetLevel()
+			local maxStamina = config.BaseStamina + (level * config.StaminaPerLevel)
+			local maxMana = config.BaseMana + (level * config.ManaPerLevel)
+
+			-- Regenerar stamina (não regenera APENAS durante sprint E andando)
+			local isSprinting = self:IsSprinting()
+			local isMoving = self.humanoid.MoveDirection.Magnitude > 0
+
+			-- Só bloqueia regeneração se está CORRENDO E ANDANDO
+			if not (isSprinting and isMoving) then
+				if self.staminaValue.Value < maxStamina then
+					self.staminaValue.Value = math.min(
+						self.staminaValue.Value + config.StaminaRegenRate,
+						maxStamina
+					)
+				end
+			end
+
+			-- Regenerar mana (sempre)
+			if self.manaValue.Value < maxMana then
+				self.manaValue.Value = math.min(
+					self.manaValue.Value + config.ManaRegenRate,
+					maxMana
+				)
+			end
+		end
+	end)
+end
+
+-- Consumir stamina
+function PlayerStatsManager:ConsumeStamina(amount)
+	if not self.staminaValue then
+		return false
+	end
+
+	if self.staminaValue.Value >= amount then
+		self.staminaValue.Value = math.max(self.staminaValue.Value - amount, 0)
+		return true
+	end
+
+	return false
+end
+
+-- Consumir mana
+function PlayerStatsManager:ConsumeMana(amount)
+	if not self.manaValue then
+		return false
+	end
+
+	if self.manaValue.Value >= amount then
+		self.manaValue.Value = math.max(self.manaValue.Value - amount, 0)
+		return true
+	end
+
+	return false
+end
+
+-- Verificar se tem stamina suficiente
+function PlayerStatsManager:HasStamina(amount)
+	return self.staminaValue and self.staminaValue.Value >= amount
+end
+
+-- Verificar se está vivo
+function PlayerStatsManager:IsAlive()
+	return self.humanoid and self.humanoid.Health > 0
+end
+
+-- Gerenciar estado de sprint
+function PlayerStatsManager:SetSprinting(isSprinting)
+	sprintingPlayers[self.player.UserId] = isSprinting
+end
+
+function PlayerStatsManager:IsSprinting()
+	return sprintingPlayers[self.player.UserId] or false
+end
+
+-- Limpar ao destruir
+function PlayerStatsManager:Cleanup()
+	if self.regenTask then
+		task.cancel(self.regenTask)
+	end
+	sprintingPlayers[self.player.UserId] = nil
+end
+
+return PlayerStatsManager
+-- ServerConfig.lua
+-- Armazene em ServerScriptService.Modules.ServerConfig
+
+local ServerConfig = {}
+
+-- Configurações de Combate
+ServerConfig.Combat = {
+	Cooldown = 0.5, -- Tempo entre ataques (segundos)
+	MinDamage = 20,
+	MaxDamage = 35,
+	HitboxDuration = 1, -- Duração da hitbox ativa
+	XPPerHit = 10, -- XP ganho por acerto
+
+	-- Custos de stamina por tipo de ataque
+	StaminaCosts = {
+		PunchL = 10,
+		PunchR = 10,
+		UpperCut = 15,
+		KickL = 15,
+		StrongPunch = 20
+	}
+}
+
+-- Configurações de Movimento
+ServerConfig.Movement = {
+	BaseSpeed = 16,
+	SprintSpeed = 35,
+	SprintSpeedPerLevel = 2, -- Velocidade adicional por nível
+	SprintStaminaCost = 20, -- Stamina mínima para começar sprint
+	SprintStaminaDrain = 5 -- Stamina consumida por segundo ao correr
+}
+
+-- Configurações de Atributos do Jogador
+ServerConfig.PlayerStats = {
+	BaseHealth = 100,
+	BaseStamina = 100,
+	BaseMana = 100,
+
+	HealthPerLevel = 10,
+	StaminaPerLevel = 10,
+	ManaPerLevel = 10,
+
+	StaminaRegenRate = 5, -- Por segundo
+	ManaRegenRate = 3, -- Por segundo
+	RegenInterval = 1 -- Intervalo de regeneração (segundos)
+}
+
+-- Configurações de Nível
+ServerConfig.Leveling = {
+	XPPerLevel = 100, -- XP necessário por nível (multiplicado pelo nível)
+	XPFormula = function(level)
+		return level * 100
+	end
+}
+
+-- Configurações de DataStore
+ServerConfig.DataStore = {
+	Name = "PlayerLevelData",
+	AutoSaveInterval = 300, -- Auto-save a cada 5 minutos
+	RetryAttempts = 3,
+	RetryDelay = 1
+}
+
+return ServerConfig
+-- SprintHandler.lua
+-- Armazene em ServerScriptService.Modules.SprintHandler
+
+local ServerConfig = require(script.Parent.ServerConfig)
+local PlayerDataManager = require(script.Parent.PlayerDataManager)
+
+local SprintHandler = {}
+
+-- Tabela para rastrear consumo de stamina durante sprint
+local sprintTasks = {}
+
+-- Validar sprint
+function SprintHandler.ValidateSprint(player, isSprinting)
+	local character = player.Character
+	if not character then
+		return false, "Personagem não encontrado"
+	end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return false, "Você está morto"
+	end
+
+	-- Se está tentando ativar sprint, verificar stamina
+	if isSprinting then
+		local staminaValue = humanoid:FindFirstChild("Stamina")
+		if not staminaValue or staminaValue.Value < ServerConfig.Movement.SprintStaminaCost then
+			return false, "Stamina insuficiente (" .. ServerConfig.Movement.SprintStaminaCost .. " necessário)"
+		end
+	end
+
+	return true, nil
+end
+
+-- Processar sprint
+function SprintHandler.ProcessSprint(player, isSprinting)
+	-- Validar
+	local isValid, errorMessage = SprintHandler.ValidateSprint(player, isSprinting)
+
+	if not isValid then
+		return false, errorMessage
+	end
+
+	local character = player.Character
+	local humanoid = character:FindFirstChild("Humanoid")
+
+	if isSprinting then
+		-- Ativar sprint
+		SprintHandler.StartSprint(player, humanoid)
+		return true, "Sprint ativado"
+	else
+		-- Desativar sprint
+		SprintHandler.StopSprint(player, humanoid)
+		return true, "Sprint desativado"
+	end
+end
+
+-- Iniciar sprint
+function SprintHandler.StartSprint(player, humanoid)
+	local playerData = PlayerDataManager.GetPlayerData(player)
+	if not playerData then return end
+
+	local level = playerData:GetLevel()
+
+	-- Calcular velocidade de sprint baseada no nível
+	local sprintSpeed = ServerConfig.Movement.SprintSpeed + 
+		(level * ServerConfig.Movement.SprintSpeedPerLevel)
+
+	humanoid.WalkSpeed = sprintSpeed
+
+	-- Cancelar task antiga se existir
+	if sprintTasks[player.UserId] then
+		task.cancel(sprintTasks[player.UserId])
+	end
+
+	-- Criar task para consumir stamina continuamente
+	sprintTasks[player.UserId] = task.spawn(function()
+		while true do
+			task.wait(1) -- Consome stamina a cada segundo
+
+			-- Verificar se ainda está vivo
+			if not humanoid or humanoid.Health <= 0 then
+				SprintHandler.StopSprint(player, humanoid)
+				break
+			end
+
+			-- NOVO: Verificar se está se movendo
+			if humanoid.MoveDirection.Magnitude == 0 then
+				print(player.Name .. " parou de se mover durante sprint - parando")
+				SprintHandler.StopSprint(player, humanoid)
+
+				-- Notificar cliente para parar
+				local sprintEvent = game.ReplicatedStorage:FindFirstChild("SprintEvent")
+				if sprintEvent then
+					sprintEvent:FireClient(player, false)
+				end
+				break
+			end
+
+			local staminaValue = humanoid:FindFirstChild("Stamina")
+			if not staminaValue then break end
+
+			-- Verificar se tem stamina suficiente
+			if staminaValue.Value >= ServerConfig.Movement.SprintStaminaDrain then
+				staminaValue.Value = math.max(
+					staminaValue.Value - ServerConfig.Movement.SprintStaminaDrain,
+					0
+				)
+			else
+				-- Stamina acabou, parar sprint
+				SprintHandler.StopSprint(player, humanoid)
+
+				-- Notificar cliente
+				local sprintEvent = game.ReplicatedStorage:FindFirstChild("SprintEvent")
+				local sprintFeedback = game.ReplicatedStorage:FindFirstChild("SprintFeedback")
+
+				if sprintEvent then
+					sprintEvent:FireClient(player, false)
+				end
+
+				if sprintFeedback then
+					sprintFeedback:FireClient(
+						player,
+						"Stamina Baixa",
+						"Stamina insuficiente para continuar correndo!"
+					)
+				end
+
+				break
+			end
+		end
+	end)
+
+	print(player.Name .. " começou a correr (Velocidade: " .. sprintSpeed .. ")")
+end
+
+-- Parar sprint
+function SprintHandler.StopSprint(player, humanoid)
+	-- Cancelar task de consumo de stamina
+	if sprintTasks[player.UserId] then
+		task.cancel(sprintTasks[player.UserId])
+		sprintTasks[player.UserId] = nil
+	end
+
+	-- Restaurar velocidade normal
+	if humanoid then
+		humanoid.WalkSpeed = ServerConfig.Movement.BaseSpeed
+	end
+
+	print(player.Name .. " parou de correr")
+end
+
+-- Limpar ao remover jogador
+function SprintHandler.CleanupPlayer(player)
+	if sprintTasks[player.UserId] then
+		task.cancel(sprintTasks[player.UserId])
+		sprintTasks[player.UserId] = nil
+	end
+end
+
+return SprintHandler
+-- CreateMartialArtsTools.lua
+-- Script para criar as Tools de Artes Marciais
+-- Armazene em ServerScriptService (rode uma vez para criar as tools)
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Função para criar uma Tool de Arte Marcial
+local function createMartialArtTool(name, description, color)
+	local tool = Instance.new("Tool")
+	tool.Name = name
+	tool.RequiresHandle = true
+	tool.CanBeDropped = true
+	tool.Grip = CFrame.new(0, -0.5, 0) * CFrame.Angles(0, 0, 0)
+
+	-- Criar Handle (necessário para Tool funcionar)
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(0.3, 1.5, 0.3)
+	handle.Material = Enum.Material.Neon
+	handle.Color = color
+	handle.CanCollide = false
+	handle.Parent = tool
+
+	-- Adicionar luz
+	local light = Instance.new("PointLight")
+	light.Color = color
+	light.Brightness = 1
+	light.Range = 8
+	light.Parent = handle
+
+	-- Adicionar efeito visual (opcional)
+	local attachment = Instance.new("Attachment")
+	attachment.Parent = handle
+
+	local particles = Instance.new("ParticleEmitter")
+	particles.Color = ColorSequence.new(color)
+	particles.Size = NumberSequence.new(0.5, 0)
+	particles.Transparency = NumberSequence.new(0.5, 1)
+	particles.Lifetime = NumberRange.new(0.5, 1)
+	particles.Rate = 20
+	particles.Speed = NumberRange.new(2, 4)
+	particles.Parent = attachment
+
+	return tool
+end
+
+-- Criar as Tools e colocá-las no ReplicatedStorage
+print("🥋 Criando Tools de Artes Marciais...")
+
+local toolsFolder = Instance.new("Folder")
+toolsFolder.Name = "MartialArtsTools"
+toolsFolder.Parent = ReplicatedStorage
+
+-- Karate (Amarelo/Dourado)
+local karateTool = createMartialArtTool(
+	"Karate",
+	"Arte marcial japonesa focada em precisão",
+	Color3.fromRGB(255, 200, 100)
+)
+karateTool.Parent = toolsFolder
+
+-- Muay Thai (Vermelho)
+local muayThaiTool = createMartialArtTool(
+	"MuayThai",
+	"Arte das oito armas",
+	Color3.fromRGB(255, 50, 50)
+)
+muayThaiTool.Parent = toolsFolder
+
+-- Kung Fu (Dourado brilhante)
+local kungFuTool = createMartialArtTool(
+	"KungFu",
+	"Arte marcial chinesa com movimentos fluidos",
+	Color3.fromRGB(255, 215, 0)
+)
+kungFuTool.Parent = toolsFolder
+
+-- Taekwondo (Azul)
+local taekwondoTool = createMartialArtTool(
+	"Taekwondo",
+	"Arte coreana focada em chutes acrobáticos",
+	Color3.fromRGB(100, 150, 255)
+)
+taekwondoTool.Parent = toolsFolder
+
+print("✅ Tools criadas em ReplicatedStorage > MartialArtsTools")
+print("🎮 Você pode clonar essas tools para o inventário dos jogadores!")
+
+-- Função helper para dar tool ao jogador quando entra
+local function giveToolsToPlayer(player)
+	player.CharacterAdded:Connect(function(character)
+		task.wait(1) -- Aguardar personagem carregar
+
+		-- Dar todas as tools (para teste)
+		-- Em produção, você escolheria quais dar
+		for _, tool in ipairs(toolsFolder:GetChildren()) do
+			local toolClone = tool:Clone()
+			toolClone.Parent = player.Backpack
+		end
+
+		print("🥋 Tools dadas para " .. player.Name)
+	end)
+end
+
+-- OPCIONAL: Dar tools automaticamente para todos os jogadores (para testes)
+local AUTO_GIVE_TOOLS = true -- Mude para false em produção
+
+if AUTO_GIVE_TOOLS then
+	game.Players.PlayerAdded:Connect(giveToolsToPlayer)
+
+	-- Dar para jogadores já no jogo
+	for _, player in ipairs(game.Players:GetPlayers()) do
+		giveToolsToPlayer(player)
+	end
+
+	print("🎁 Sistema de auto-dar tools ATIVO (modo teste)")
+end
+-- ServerMain.lua
+-- Armazene em ServerScriptService (script principal do servidor)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Aguardar módulos
+local Modules = script.Parent:WaitForChild("Modules")
+local ServerConfig = require(Modules:WaitForChild("ServerConfig"))
+local PlayerDataManager = require(Modules:WaitForChild("PlayerDataManager"))
+local PlayerStatsManager = require(Modules:WaitForChild("PlayerStatsManager"))
+local CombatHandler = require(Modules:WaitForChild("CombatHandler"))
+local SprintHandler = require(Modules:WaitForChild("SprintHandler"))
+local FireballHandler = require(Modules:WaitForChild("FireballHandler"))
+local DefenseHandler = require(Modules:WaitForChild("DefenseHandler"))
+
+-- Criar RemoteEvents se não existirem
+local function createRemoteEvent(name)
+	local event = ReplicatedStorage:FindFirstChild(name)
+	if not event then
+		event = Instance.new("RemoteEvent")
+		event.Name = name
+		event.Parent = ReplicatedStorage
+		print("RemoteEvent criado: " .. name)
+	end
+	return event
+end
+
+local CombatEvent = createRemoteEvent("CombatEvent")
+local CombatFeedback = createRemoteEvent("CombatFeedback")
+local SprintEvent = createRemoteEvent("SprintEvent")
+local SprintFeedback = createRemoteEvent("SprintFeedback")
+local ComboEvent = createRemoteEvent("ComboEvent")
+local FireballEvent = createRemoteEvent("FireballEvent")
+local DefenseEvent = createRemoteEvent("DefenseEvent")
+local DefenseFeedback = createRemoteEvent("DefenseFeedback")
+
+-- Tabela para armazenar PlayerStatsManager de cada personagem
+local characterStatsManagers = {}
+
+-- Função para inicializar jogador
+local function onPlayerAdded(player)
+	-- Criar e inicializar dados do jogador
+	PlayerDataManager.CreatePlayerData(player)
+
+	print(player.Name .. " entrou no jogo")
+
+	-- Conectar ao CharacterAdded
+	player.CharacterAdded:Connect(function(character)
+		-- Aguardar humanoid
+		local humanoid = character:WaitForChild("Humanoid")
+
+		-- Criar gerenciador de stats para este personagem
+		local statsManager = PlayerStatsManager.new(player, character)
+		characterStatsManagers[character] = statsManager
+
+		print("Personagem de " .. player.Name .. " inicializado")
+
+		-- Limpar ao morrer ou remover personagem
+		humanoid.Died:Connect(function()
+			if characterStatsManagers[character] then
+				characterStatsManagers[character]:Cleanup()
+				characterStatsManagers[character] = nil
+			end
+		end)
+
+		character.AncestryChanged:Connect(function()
+			if not character.Parent and characterStatsManagers[character] then
+				characterStatsManagers[character]:Cleanup()
+				characterStatsManagers[character] = nil
+			end
+		end)
+	end)
+end
+
+-- Função para remover jogador
+local function onPlayerRemoving(player)
+	-- Limpar dados do jogador
+	PlayerDataManager.RemovePlayerData(player)
+	CombatHandler.CleanupPlayer(player)
+	SprintHandler.CleanupPlayer(player)
+	FireballHandler.CleanupPlayer(player)
+	DefenseHandler.CleanupPlayer(player)
+
+	print(player.Name .. " saiu do jogo")
+end
+
+-- Conectar eventos de jogadores
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(onPlayerRemoving)
+
+-- Processar jogadores que já estão no jogo (útil para testes)
+for _, player in ipairs(Players:GetPlayers()) do
+	task.spawn(onPlayerAdded, player)
+end
+
+-- Handler para CombatEvent
+CombatEvent.OnServerEvent:Connect(function(player, attackType, limb)
+	local success, message = CombatHandler.ProcessAttack(player, attackType, limb)
+
+	if not success then
+		-- Enviar feedback de erro ao cliente
+		CombatFeedback:FireClient(player, "Erro", message)
+		print(player.Name .. " - Ataque falhou: " .. message)
+	else
+		print(player.Name .. " - " .. message .. " (" .. attackType .. ")")
+	end
+end)
+
+-- Handler para SprintEvent
+SprintEvent.OnServerEvent:Connect(function(player, isSprinting)
+	local success, message = SprintHandler.ProcessSprint(player, isSprinting)
+
+	if not success then
+		-- Enviar feedback de erro ao cliente
+		SprintFeedback:FireClient(player, "Erro", message)
+		print(player.Name .. " - Sprint falhou: " .. message)
+	else
+		print(player.Name .. " - " .. message)
+	end
+end)
+
+-- Handler para FireballEvent
+FireballEvent.OnServerEvent:Connect(function(player, mousePosition)
+	local success, message = FireballHandler.ProcessFireball(player, mousePosition)
+
+	if not success then
+		CombatFeedback:FireClient(player, "Fireball", message)
+		print(player.Name .. " - Fireball falhou: " .. message)
+	else
+		print(player.Name .. " - " .. message)
+	end
+end)
+
+-- Handler para DefenseEvent (Sistema de Defesa)
+DefenseEvent.OnServerEvent:Connect(function(player, action, data)
+	-- Carregar config do cliente
+	local DefenseSystemConfig = require(ReplicatedStorage.Modules.DefenseSystemConfig)
+
+	local success, message = DefenseHandler.ProcessDefense(player, action, data, DefenseSystemConfig)
+
+	if not success then
+		DefenseFeedback:FireClient(player, "Erro", message)
+		print(player.Name .. " - Defesa falhou: " .. message)
+	else
+		print(player.Name .. " - " .. message .. " (" .. action .. ")")
+	end
+end)
+
+-- Auto-save periódico (opcional, mas recomendado)
+task.spawn(function()
+	while true do
+		task.wait(ServerConfig.DataStore.AutoSaveInterval)
+
+		print("Executando auto-save de todos os jogadores...")
+
+		for _, player in ipairs(Players:GetPlayers()) do
+			local playerData = PlayerDataManager.GetPlayerData(player)
+			if playerData then
+				task.spawn(function()
+					playerData:SaveData()
+				end)
+			end
+		end
+	end
+end)
+
+print("ServerMain inicializado com sucesso!")
+print("Sistema de combate, sprint, fireball e defesa ativados")
+print("Auto-save configurado para " .. ServerConfig.DataStore.AutoSaveInterval .. " segundos")
+-- ClientMain.lua
+-- Armazene em StarterPlayer > StarterPlayerScripts
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ContentProvider = game:GetService("ContentProvider")
+local StarterGui = game:GetService("StarterGui")
+
+-- Aguardar módulos
+local Modules = ReplicatedStorage:WaitForChild("Modules")
+local ConfigModule = require(Modules:WaitForChild("ConfigModule"))
+local MartialArtsConfig = require(Modules:WaitForChild("MartialArtsConfig"))
+local AnimationManager = require(Modules:WaitForChild("AnimationManager"))
+local SoundManager = require(Modules:WaitForChild("SoundManager"))
+local CombatController = require(Modules:WaitForChild("CombatController"))
+local SprintController = require(Modules:WaitForChild("SprintController"))
+local GUIManager = require(Modules:WaitForChild("GUIManager"))
+local DoubleJumpController = require(Modules:WaitForChild("DoubleJumpController"))
+local ComboController = require(Modules:WaitForChild("ComboController"))
+local FireballController = require(Modules:WaitForChild("FireballController"))
+local MartialArtsController = require(Modules:WaitForChild("MartialArtsController"))
+local DefenseSystemConfig = require(Modules:WaitForChild("DefenseSystemConfig"))
+local DefenseController = require(Modules:WaitForChild("DefenseController"))
+local DefenseEvent = ReplicatedStorage:WaitForChild("DefenseEvent", 5)
+
+-- Eventos remotos
+local CombatEvent = ReplicatedStorage:WaitForChild("CombatEvent")
+local SprintEvent = ReplicatedStorage:WaitForChild("SprintEvent", 5)
+local SprintFeedback = ReplicatedStorage:WaitForChild("SprintFeedback", 5)
+local ComboEvent = ReplicatedStorage:WaitForChild("ComboEvent", 5)
+local FireballEvent = ReplicatedStorage:WaitForChild("FireballEvent", 5)
+
+-- Player e Character
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local animator = humanoid:WaitForChild("Animator")
+
+-- Controladores globais
+local animationManager
+local soundManager
+local combatController
+local sprintController
+local guiManager
+local doubleJumpController
+local comboController
+local fireballController
+local martialArtsController
+local defenseController
+
+-- Função para precarregar assets
+local function preloadAssets()
+	local assetsToLoad = {}
+
+	-- Sons
+	for _, id in pairs(ConfigModule.AssetIds.Sounds) do
+		table.insert(assetsToLoad, id)
+	end
+
+	-- Animações
+	for _, id in pairs(ConfigModule.AssetIds.Animations) do
+		table.insert(assetsToLoad, id)
+	end
+
+	-- Imagens
+	for _, id in pairs(ConfigModule.AssetIds.Images) do
+		table.insert(assetsToLoad, id)
+	end
+
+	ContentProvider:PreloadAsync(assetsToLoad)
+	print("Assets precarregados")
+end
+
+-- Função para inicializar sistemas
+local function initializeSystems()
+	-- Precarregar assets
+	preloadAssets()
+
+	-- Criar gerenciadores
+	animationManager = AnimationManager.new(animator, ConfigModule)
+	soundManager = SoundManager.new(character, ConfigModule)
+	combatController = CombatController.new(humanoid, animationManager, soundManager, CombatEvent)
+	sprintController = SprintController.new(humanoid, animationManager, soundManager, SprintEvent)
+	guiManager = GUIManager.new(player, humanoid, ConfigModule)
+	doubleJumpController = DoubleJumpController.new(humanoid, animationManager, ConfigModule)
+	comboController = ComboController.new(player, ConfigModule)
+	fireballController = FireballController.new(player, humanoid, animationManager, FireballEvent, ConfigModule)
+	defenseController = DefenseController.new(player, humanoid, guiManager, DefenseEvent, DefenseSystemConfig)
+
+	print("Sistemas inicializados (incluindo Fireball e Artes Marciais)")
+end
+
+-- Função para criar losangos na GUI
+local function createDiamonds()
+	local diamondSize = ConfigModule.GameplaySettings.DiamondSize
+	local padding = ConfigModule.GameplaySettings.Padding
+	local offset = (diamondSize / 1.414) + padding
+
+	-- Posições dos losangos principais (cruz)
+	local mainPositions = {
+		UDim2.new(0.5, 0, 0.5, -offset),  -- Cima
+		UDim2.new(0.5, 0, 0.5, offset),   -- Baixo
+		UDim2.new(0.5, offset, 0.5, 0),   -- Direita
+		UDim2.new(0.5, -offset, 0.5, 0)   -- Esquerda
+	}
+
+	-- IMPORTANTE: Criar losangos do estilo básico inicialmente
+	-- O MartialArtsController vai trocar quando equipar Tool
+	local basicStyle = MartialArtsConfig.Styles.Basic
+	for i, attack in ipairs(basicStyle.Attacks) do
+		guiManager:createDiamond(
+			guiManager.staminaFrame,
+			mainPositions[i],
+			diamondSize,
+			attack.color,
+			attack.image,
+			attack.threshold,
+			attack.type,
+			attack.limb,
+			function(actionType, limb, threshold)
+				combatController:tryAttack(actionType, limb, threshold)
+			end
+		)
+	end
+
+	-- Criar losangos laterais (corrida e danças) - ESTES NÃO MUDAM
+	local smallSize = ConfigModule.GameplaySettings.SmallDiamondSize
+	local smallPadding = padding * 2
+	local smallOffset = smallSize + smallPadding
+
+	for i, config in ipairs(ConfigModule.SideDiamondConfigs) do
+		local position = UDim2.new(0.5, 0, 0, (i - 1) * smallOffset)
+
+		guiManager:createDiamond(
+			guiManager.rightDiamondsFrame,
+			position,
+			smallSize,
+			config.color,
+			config.image,
+			config.threshold,
+			config.type,
+			nil,
+			function(actionType)
+				if actionType == "Run" then
+					sprintController:tryRun()
+				elseif actionType == "Dab" or actionType == "Hype" then
+					combatController:tryDance(actionType)
+				end
+			end
+		)
+	end
+
+	-- CRIAR O CONTROLADOR DE ARTES MARCIAIS (após GUI estar pronta)
+	martialArtsController = MartialArtsController.new(player, guiManager, combatController)
+
+	print("Losangos criados e MartialArtsController ativo")
+end
+
+-- Função para configurar listeners de eventos do servidor
+local function setupServerListeners()
+	-- Sprint feedback
+	if SprintEvent then
+		SprintEvent.OnClientEvent:Connect(function(isSprintingServer)
+			if not isSprintingServer then
+				sprintController:stopRun()
+			end
+		end)
+	end
+
+	-- Notificações de sprint
+	if SprintFeedback then
+		SprintFeedback.OnClientEvent:Connect(function(title, message)
+			StarterGui:SetCore("SendNotification", {
+				Title = title,
+				Text = message,
+				Duration = 3
+			})
+		end)
+	end
+
+	-- Evento de combo
+	if ComboEvent then
+		ComboEvent.OnClientEvent:Connect(function(targetName, damage)
+			if comboController then
+				comboController:addHit(targetName, damage)
+			end
+		end)
+	end
+
+	print("Listeners do servidor configurados")
+end
+
+-- Função para configurar movimento após respawn
+local function setupMovement(hum)
+	local rootPart = hum.Parent:WaitForChild("HumanoidRootPart", 5)
+	if rootPart then
+		wait(0.5)
+		hum.PlatformStand = false
+		rootPart.Anchored = false
+	end
+end
+
+-- Função para reinicializar após respawn
+local function onCharacterAdded(newChar)
+	character = newChar
+	humanoid = newChar:WaitForChild("Humanoid")
+	animator = humanoid:WaitForChild("Animator")
+
+	-- Limpar sistemas antigos
+	if animationManager then animationManager:cleanup() end
+	if soundManager then soundManager:cleanup() end
+	if combatController then combatController:reset() end
+	if sprintController then sprintController:reset() end
+	if guiManager then guiManager:cleanup() end
+	if doubleJumpController then doubleJumpController:cleanup() end
+	if comboController then comboController:cleanup() end
+	if fireballController then fireballController:cleanup() end
+	if martialArtsController then martialArtsController:cleanup() end
+	if defenseController then defenseController:cleanup() end
+
+	-- Reinicializar sistemas
+	initializeSystems()
+	createDiamonds()
+	setupMovement(humanoid)
+
+	print("Sistemas reinicializados após respawn (incluindo Artes Marciais)")
+end
+
+-- Inicializar pela primeira vez
+initializeSystems()
+createDiamonds()
+setupServerListeners()
+setupMovement(humanoid)
+
+-- Reconectar quando o personagem renascer
+player.CharacterAdded:Connect(onCharacterAdded)
+
+print("ClientMain inicializado com sucesso (com Sistema de Artes Marciais e Fireball)")
